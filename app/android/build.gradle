@@ -1,0 +1,27 @@
+buildscript {
+    ext {
+        buildToolsVersion = "35.0.0"
+        // 26: the ML Kit face-detector plugin's floor; VisionCamera frame
+        // processors also assume API 26+.
+        minSdkVersion = 26
+        compileSdkVersion = 35
+        targetSdkVersion = 35
+        ndkVersion = "26.1.10909125"
+        // One Kotlin version across the app and every library — the
+        // face-detector plugin's default (2.1.20) is overridden to match.
+        kotlinVersion = "2.0.21"
+        VisionCameraFaceDetector_kotlinVersion = "2.0.21"
+        VisionCameraFaceDetector_ndkVersion = "26.1.10909125"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"

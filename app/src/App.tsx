@@ -30,6 +30,7 @@ import {
   type EmbeddingExtractor,
 } from './ml/embedding';
 import { seal } from './ml/seal';
+import { getLatestFaceCrop, TfliteEmbeddingExtractor } from './ml/tfliteExtractor';
 import { DocumentCaptureScreen } from './screens/DocumentCaptureScreen';
 import { IdentityScreen, type IdentityInfo } from './screens/IdentityScreen';
 import { LivenessChallengeScreen } from './screens/LivenessChallengeScreen';
@@ -130,10 +131,26 @@ export function reduceFlow(state: FlowState, action: FlowAction): FlowState {
 // -- processing pipeline --------------------------------------------------------
 
 /**
+ * The default extractor: the REAL on-device model when it loads, the
+ * deterministic stub when it cannot (emulator / jest / missing native
+ * runtime). PHASE-A DEMO FALLBACK — the stub keeps the enroll→verify pipeline
+ * exercisable end to end without a camera, but it has no biometric meaning;
+ * production must hard-fail here instead of falling back (Phase B hardening).
+ */
+async function resolveDefaultExtractor(): Promise<EmbeddingExtractor> {
+  try {
+    return await TfliteEmbeddingExtractor.load();
+  } catch {
+    return new StubEmbeddingExtractor();
+  }
+}
+
+/**
  * Extract → seal → enroll-if-needed → verify. Any failure dispatches
- * FLOW_ERROR (fail closed). The frame argument is the skeleton placeholder —
- * the real frame arrives via the frame processor next iteration; the stub
- * extractor deterministically maps it to a unit embedding.
+ * FLOW_ERROR (fail closed). The frame argument is the freshest face crop
+ * captured by the liveness frame processor (the runOnJS mailbox); when no
+ * crop exists (stub path) the stub extractor still maps the placeholder
+ * deterministically, and the real extractor refuses it — fail closed.
  */
 async function runProcessingPipeline(
   client: FaceVerifyClient,
@@ -141,7 +158,7 @@ async function runProcessingPipeline(
   identity: IdentityInfo,
   consentVersion: string,
 ): Promise<Verdict> {
-  const embedding = await extractor.extractEmbedding('skeleton-frame');
+  const embedding = await extractor.extractEmbedding(getLatestFaceCrop() ?? 'skeleton-frame');
   const embeddingEnc = seal(encodeEmbeddingForWire(embedding));
   const status = await client.getEnrollmentStatusByNationalId(identity.nationalId);
   if (!isEnrolled(status)) {
@@ -159,7 +176,7 @@ async function runProcessingPipeline(
 // -- root component ---------------------------------------------------------------
 
 export interface AppProps {
-  /** Test seams — production uses the real client and the stub extractor. */
+  /** Test seams — production resolves the real extractor (see resolveDefaultExtractor). */
   client?: FaceVerifyClient;
   extractor?: EmbeddingExtractor;
 }
@@ -170,12 +187,15 @@ export default function App({ client, extractor }: AppProps): React.JSX.Element 
   useEffect(() => {
     if (state.step !== 'processing') return;
     let cancelled = false;
-    runProcessingPipeline(
-      client ?? createFaceVerifyClient(),
-      extractor ?? new StubEmbeddingExtractor(),
-      state.identity,
-      state.consentVersion,
-    )
+    (extractor ? Promise.resolve(extractor) : resolveDefaultExtractor())
+      .then((resolved) =>
+        runProcessingPipeline(
+          client ?? createFaceVerifyClient(),
+          resolved,
+          state.identity,
+          state.consentVersion,
+        ),
+      )
       .then((verdict) => {
         if (!cancelled) dispatch({ type: 'VERDICT_RECEIVED', verdict });
       })

@@ -3,18 +3,19 @@
  * front/back, design §3 step 2). The capture stays on-device; the image is
  * discarded after the flow and never uploaded (design §4).
  *
- * VISION-CAMERA WIRING POINT (this pass = shell only, no frame processing):
- *   - The real capture uses <Camera> from react-native-vision-camera with the
- *     back device; jest maps that module to a pure-JS stub, so this screen
- *     renders its guidance path in unit tests.
- *   - Next iteration adds a frame processor that detects the document edges
- *     on-device and auto-captures when the framing is good; the captured
- *     frame feeds the document checks, then is discarded.
+ * VISION-CAMERA WIRING: renders the real <Camera> (front camera, consistent
+ * with the selfie-first flow of this app) when a device and permission exist;
+ * jest maps vision-camera to a stub that reports no device, so unit tests
+ * deterministically render the guidance-placeholder path.
+ *
+ * Document edge detection/auto-capture is explicitly a NEXT-iteration item
+ * (a document model is not part of this pipeline), so this screen attaches no
+ * frame processor yet — the camera is preview-only here.
  */
 
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { Camera, useCameraDevice } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 
 export interface DocumentCaptureScreenProps {
   onCaptured: () => void;
@@ -23,17 +24,22 @@ export interface DocumentCaptureScreenProps {
 export function DocumentCaptureScreen({
   onCaptured,
 }: DocumentCaptureScreenProps): React.JSX.Element {
-  const device = useCameraDevice('back');
+  const device = useCameraDevice('front');
+  const { hasPermission, requestPermission } = useCameraPermission();
+
+  useEffect(() => {
+    if (!hasPermission) void requestPermission();
+  }, []);
 
   return (
     <View style={styles.container} testID="document-capture-screen">
       <Text style={styles.title}>Scan your national ID</Text>
       <View style={styles.cameraShell} testID="document-camera-shell">
-        {device ? (
+        {device && hasPermission ? (
           // Native path — exercised only on a real device, never in jest.
           <Camera style={StyleSheet.absoluteFill} device={device} isActive />
         ) : (
-          // Skeleton/test path: framing guidance placeholder.
+          // Emulator/test path: framing guidance placeholder.
           <View style={styles.framingGuide} testID="document-framing-guide">
             <Text style={styles.framingText}>
               Camera preview appears here.{'\n\n'}Place the front of your national ID inside the

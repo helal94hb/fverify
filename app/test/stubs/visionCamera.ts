@@ -18,3 +18,10 @@ export const useCameraPermission = (): {
   hasPermission: false,
   requestPermission: () => Promise.resolve(false),
 });
+
+/**
+ * Frame processors are worklets that only ever execute on a real device.
+ * The stub returns an inert function; jest never invokes it because the
+ * camera stub above renders no device.
+ */
+export const useFrameProcessor = (frameProcessor: unknown): unknown => frameProcessor;

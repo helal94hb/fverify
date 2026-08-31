@@ -9,7 +9,7 @@
  * is ~1.0. If the two implementations ever drift, that test fails.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
 import { createStubEmbedding, encodeEmbeddingForWire } from '../src/ml/embedding';
 import { seal } from '../src/ml/seal';
