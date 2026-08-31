@@ -22,10 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import crypto, match, seal
+from . import crypto, match, otp, seal, sms, t24
 from .config import Settings, get_settings
 from .errors import ProblemError, invalid_embedding
-from .models import AuditEvent, Enrollment, utcnow
+from .models import AuditEvent, Enrollment, OtpRecord, utcnow
 
 router = APIRouter(prefix="/api/v1")
 
@@ -39,12 +39,28 @@ class EnrollRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     national_id: str = Field(min_length=1, max_length=64)
-    mobile: str = Field(min_length=1, max_length=32)
-    consent_version: str = Field(min_length=1, max_length=32)
 
 
 class EnrollResponse(BaseModel):
     enrollment_id: str
+    status: str
+    #: the masked REGISTERED mobile the OTP went to (never the full number)
+    mobile_hint: str
+
+
+class OtpVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    otp_code: str = Field(min_length=4, max_length=8)
+
+
+class ConsentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    consent_version: str = Field(min_length=1, max_length=32)
+
+
+class StageResponse(BaseModel):
     status: str
 
 
@@ -62,12 +78,16 @@ class FaceSubmitResponse(BaseModel):
 class StatusResponse(BaseModel):
     enrolled: bool
     enrolled_at: str | None
+    #: the T24 anchor (when resolved) + the enrollment's stage
+    customer_id: str | None = None
+    status: str | None = None
 
 
 class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    national_id: str = Field(min_length=1, max_length=64)
+    national_id: str | None = Field(default=None, max_length=64)
+    customer_id: str | None = Field(default=None, max_length=64)
     embedding_enc: str = Field(min_length=1)
 
 
@@ -177,31 +197,126 @@ async def _audit(
 
 @router.post("/enrollments", status_code=201, response_model=EnrollResponse)
 async def create_enrollment(body: EnrollRequest, session: SessionDep, request: Request):
+    """Owner ruling 2026-08-31 — the identity anchor is the CORE: the national
+    id resolves via T24 to the real customer id + REGISTERED mobile, and
+    fverify's own OTP goes to that registered number. No T24 anchor, no
+    enrollment; nobody self-asserts a phone number."""
+    customer = await t24.resolve_customer(body.national_id)
+    if customer is None:
+        await _audit(session, body.national_id, "enrollment", "rejected", detail="not-a-customer")
+        await session.commit()
+        raise ProblemError(
+            404,
+            "not-a-customer",
+            "We could not find a customer for this national ID",
+            "Please check the number or visit a branch.",
+        )
+
     existing = await session.scalar(
         select(Enrollment).where(Enrollment.national_id == body.national_id)
     )
     if existing is not None:
-        # Idempotent: a second enroll for the same national_id returns the open record.
-        return EnrollResponse(enrollment_id=existing.id, status=existing.status)
+        # Idempotent — but a resend while awaiting the OTP respects the cooldown.
+        if existing.status == "awaiting_otp":
+            record = await session.get(OtpRecord, existing.id)
+            remaining = otp.resend_cooldown_remaining(record)
+            if remaining > 0:
+                raise ProblemError(
+                    429,
+                    "otp-resend-cooldown",
+                    "A code was just sent",
+                    f"Please wait {remaining}s before requesting a new one.",
+                )
+            code = await otp.mint_and_store(session, existing.id)
+            hint = await sms.send_otp_sms(existing.mobile, code)
+            await session.commit()
+            return EnrollResponse(
+                enrollment_id=existing.id, status=existing.status, mobile_hint=hint
+            )
+        return EnrollResponse(
+            enrollment_id=existing.id,
+            status=existing.status,
+            mobile_hint=sms.mask_mobile(existing.mobile),
+        )
 
     enrollment = Enrollment(
         national_id=body.national_id,
-        mobile=body.mobile,
-        consent_version=body.consent_version,
-        status="awaiting_face",
+        customer_id=customer["customer_id"],
+        mobile=customer["mobile"],
+        status="awaiting_otp",
     )
     session.add(enrollment)
     await session.flush()
+    code = await otp.mint_and_store(session, enrollment.id)
+    hint = await sms.send_otp_sms(enrollment.mobile, code)
     await _audit(
         session,
         national_id=body.national_id,
         enrollment_id=enrollment.id,
         event="enrollment",
         outcome="created",
+    )
+    await session.commit()
+    return EnrollResponse(
+        enrollment_id=enrollment.id, status=enrollment.status, mobile_hint=hint
+    )
+
+
+@router.post("/enrollments/{enrollment_id}/otp", response_model=StageResponse)
+async def verify_enrollment_otp(
+    enrollment_id: str, body: OtpVerifyRequest, session: SessionDep
+):
+    enrollment = await session.get(Enrollment, enrollment_id)
+    if enrollment is None:
+        raise ProblemError(
+            404, "enrollment-not-found", "Enrollment not found", "No such enrollment."
+        )
+    if enrollment.status != "awaiting_otp":
+        raise ProblemError(
+            409, "invalid-stage", "This step is not available now", "Continue in the app."
+        )
+    if not await otp.verify(session, enrollment.id, body.otp_code):
+        await _audit(
+            session, enrollment.national_id, enrollment_id=enrollment.id,
+            event="otp", outcome="rejected",
+        )
+        await session.commit()
+        raise ProblemError(
+            422,
+            "invalid-otp",
+            "That code is incorrect or expired",
+            "Request a new code and try again.",
+        )
+    enrollment.status = "awaiting_consent"
+    await _audit(
+        session, enrollment.national_id, enrollment_id=enrollment.id,
+        event="otp", outcome="verified",
+    )
+    await session.commit()
+    return StageResponse(status=enrollment.status)
+
+
+@router.post("/enrollments/{enrollment_id}/consent", response_model=StageResponse)
+async def record_consent(enrollment_id: str, body: ConsentRequest, session: SessionDep):
+    enrollment = await session.get(Enrollment, enrollment_id)
+    if enrollment is None:
+        raise ProblemError(
+            404, "enrollment-not-found", "Enrollment not found", "No such enrollment."
+        )
+    if enrollment.status != "awaiting_consent":
+        raise ProblemError(
+            409, "invalid-stage", "This step is not available now", "Continue in the app."
+        )
+    enrollment.consent_version = body.consent_version
+    enrollment.consent_at = utcnow()
+    enrollment.status = "awaiting_face"
+    await _audit(
+        session, enrollment.national_id, enrollment_id=enrollment.id,
+        event="enrollment", outcome="consent-recorded",
         detail=f"consent_version={body.consent_version}",
     )
     await session.commit()
-    return EnrollResponse(enrollment_id=enrollment.id, status=enrollment.status)
+    return StageResponse(status=enrollment.status)
 
 
 @router.post("/enrollments/{enrollment_id}/face", response_model=FaceSubmitResponse)
@@ -218,11 +333,14 @@ async def submit_face(
         return FaceSubmitResponse(
             status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat()
         )
-    if not enrollment.consent_version:
-        # Defense in depth: consent is required at enrollment creation, and we
-        # re-check here so no face data is ever stored without it.
+    if enrollment.status != "awaiting_face":
+        # The staged flow (T24 anchor → OTP → consent) must be complete before
+        # any face data is accepted.
         raise ProblemError(
-            409, "consent-required", "Consent required", "Consent must be recorded first."
+            409,
+            "invalid-stage",
+            "The enrollment is not ready for the face step",
+            "Complete the code verification and consent first.",
         )
 
     embedding = _unseal_embedding(body.embedding_enc, request)
@@ -250,36 +368,58 @@ async def enrollment_status(national_id: str, session: SessionDep):
         select(Enrollment).where(Enrollment.national_id == national_id)
     )
     if enrollment is None or enrollment.status != "enrolled":
-        return StatusResponse(enrolled=False, enrolled_at=None)
-    return StatusResponse(enrolled=True, enrolled_at=enrollment.enrolled_at.isoformat())
+        return StatusResponse(
+            enrolled=False,
+            enrolled_at=None,
+            customer_id=enrollment.customer_id if enrollment else None,
+            status=enrollment.status if enrollment else None,
+        )
+    return StatusResponse(
+        enrolled=True,
+        enrolled_at=enrollment.enrolled_at.isoformat(),
+        customer_id=enrollment.customer_id,
+        status=enrollment.status,
+    )
 
 
 @router.post("/verifications", response_model=VerifyResponse)
 async def verify(body: VerifyRequest, session: SessionDep, request: Request, settings: SettingsDep):
     threshold = settings.match_threshold
 
+    # Exactly one identity key (owner ruling 2026-08-31 — the T24 anchor is a
+    # first-class key beside the national id).
+    key = body.national_id or body.customer_id
+    if key is None or (body.national_id and body.customer_id):
+        raise ProblemError(
+            422,
+            "invalid-identity",
+            "Provide exactly one identity key",
+            "national_id OR customer_id.",
+        )
+    audit_id = key
+
     # Sealed-in-transit is enforced uniformly, before any identity lookup.
     try:
         embedding = _unseal_embedding(body.embedding_enc, request)
     except ProblemError as exc:
         await _audit(
-            session, body.national_id, "verification", "rejected", detail="invalid payload"
+            session, audit_id, "verification", "rejected", detail="invalid payload"
         )
         await session.commit()
         raise exc
 
-    # Lockout: too many recent failed attempts for this national_id.
+    # Lockout: too many recent failed attempts for this identity.
     cutoff = utcnow() - timedelta(seconds=settings.verify_window_seconds)
     recent_failures = await session.scalar(
         select(func.count(AuditEvent.id)).where(
-            AuditEvent.national_id == body.national_id,
+            AuditEvent.national_id == audit_id,
             AuditEvent.event == "verification",
             AuditEvent.outcome == "rejected",
             AuditEvent.created_at >= cutoff,
         )
     )
     if (recent_failures or 0) >= settings.verify_max_attempts:
-        await _audit(session, body.national_id, "verification", "locked")
+        await _audit(session, audit_id, "verification", "locked")
         await session.commit()
         raise ProblemError(
             429,
@@ -288,16 +428,24 @@ async def verify(body: VerifyRequest, session: SessionDep, request: Request, set
             "Too many failed verification attempts. Try again later.",
         )
 
-    enrollment = await session.scalar(
-        select(Enrollment).where(
-            Enrollment.national_id == body.national_id,
-            Enrollment.status == "enrolled",
+    if body.national_id:
+        enrollment = await session.scalar(
+            select(Enrollment).where(
+                Enrollment.national_id == body.national_id,
+                Enrollment.status == "enrolled",
+            )
         )
-    )
+    else:
+        enrollment = await session.scalar(
+            select(Enrollment).where(
+                Enrollment.customer_id == body.customer_id,
+                Enrollment.status == "enrolled",
+            )
+        )
 
     if enrollment is None or enrollment.embedding_encrypted is None:
         # Anti-enumeration: identical response shape to a genuine mismatch.
-        await _audit(session, body.national_id, "verification", "rejected")
+        await _audit(session, audit_id, "verification", "rejected")
         await session.commit()
         return VerifyResponse(verdict="rejected", score=0.0, threshold=threshold)
 
@@ -309,7 +457,7 @@ async def verify(body: VerifyRequest, session: SessionDep, request: Request, set
 
     await _audit(
         session,
-        body.national_id,
+        audit_id,
         "verification",
         "verified" if verdict == "verified" else "rejected",
         enrollment_id=enrollment.id,
