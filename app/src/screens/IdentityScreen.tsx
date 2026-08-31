@@ -1,7 +1,7 @@
 /**
- * Self-asserted identity — national ID + mobile (PoC posture, design §7
- * decision 1: production needs a real identity anchor; nothing here silently
- * resolves that). Validation is minimal and honest: both fields required.
+ * Identity — the national ID only (owner ruling 2026-08-31: the anchor is
+ * T24; the core resolves the customer id + the REGISTERED mobile, so the
+ * customer never types a phone number here — and nobody can self-assert one).
  */
 
 import React, { useState } from 'react';
@@ -9,7 +9,6 @@ import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 export interface IdentityInfo {
   nationalId: string;
-  mobile: string;
 }
 
 export interface IdentityScreenProps {
@@ -18,8 +17,7 @@ export interface IdentityScreenProps {
 
 export function IdentityScreen({ onSubmit }: IdentityScreenProps): React.JSX.Element {
   const [nationalId, setNationalId] = useState('');
-  const [mobile, setMobile] = useState('');
-  const ready = nationalId.trim().length > 0 && mobile.trim().length > 0;
+  const ready = nationalId.trim().length >= 8;
 
   return (
     <View style={styles.container} testID="identity-screen">
@@ -35,20 +33,11 @@ export function IdentityScreen({ onSubmit }: IdentityScreenProps): React.JSX.Ele
         keyboardType="visible-password"
         placeholder="National ID number"
       />
-      <Text style={styles.label}>Mobile number</Text>
-      <TextInput
-        style={styles.input}
-        testID="mobile-input"
-        value={mobile}
-        onChangeText={setMobile}
-        keyboardType="phone-pad"
-        placeholder="Mobile number"
-      />
       <Pressable
         style={[styles.primaryButton, !ready && styles.disabled]}
         testID="identity-submit-button"
         disabled={!ready}
-        onPress={() => onSubmit({ nationalId: nationalId.trim(), mobile: mobile.trim() })}
+        onPress={() => onSubmit({ nationalId: nationalId.trim() })}
       >
         <Text style={styles.primaryButtonText}>Continue</Text>
       </Pressable>

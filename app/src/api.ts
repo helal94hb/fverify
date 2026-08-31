@@ -2,16 +2,16 @@
  * The sealed backend client — the ONLY module that speaks HTTP to the
  * standalone face-verify backend (base URL comes from ./config).
  *
- * Contract (design doc §3, backend track):
+ * Contract (INTEGRATION.md — the staged enrollment, owner rulings 2026-08-31):
  *   POST /api/v1/enrollments
- *       {national_id, mobile, consent_version} → {enrollment_id, status}
- *   POST /api/v1/enrollments/{id}/face
- *       {embedding_enc} → {status:'enrolled'}
+ *       {national_id} → {enrollment_id, status:'awaiting_otp', mobile_hint}
+ *   POST /api/v1/enrollments/{id}/otp {otp_code} → {status:'awaiting_consent'}
+ *   POST /api/v1/enrollments/{id}/consent {consent_version} → {status:'awaiting_face'}
+ *   POST /api/v1/enrollments/{id}/face {embedding_enc} → {status:'enrolled'}
  *   GET  /api/v1/enrollments/by-national-id/{id}/status
- *       → enrollment status record (treated as enrolled ONLY when the
- *         payload's status field is exactly 'enrolled' — fail closed)
+ *       → {enrolled, enrolled_at, customer_id, status}
  *   POST /api/v1/verifications
- *       {national_id, embedding_enc} → {verdict, score, threshold}
+ *       {national_id | customer_id, embedding_enc} → {verdict, score, threshold}
  *
  * Invariants honored here:
  *   - The ONLY biometric that crosses the wire is `embedding_enc` — an
@@ -27,12 +27,16 @@ import { API_BASE_URL } from './config';
 
 export interface CreateEnrollmentRequest {
   nationalId: string;
-  mobile: string;
-  consentVersion: string;
 }
 
 export interface CreateEnrollmentResponse {
   enrollment_id: string;
+  status: string;
+  /** the masked REGISTERED mobile the OTP went to (never the full number) */
+  mobile_hint: string;
+}
+
+export interface StageResponse {
   status: string;
 }
 
@@ -44,6 +48,9 @@ export interface EnrollmentStatusResponse {
   /** The backend's actual shape — enrolled flag + ISO timestamp (or null). */
   enrolled: boolean;
   enrolled_at: string | null;
+  /** the T24 anchor (when resolved) + the enrollment's stage */
+  customer_id: string | null;
+  status: string | null;
 }
 
 /** Server-computed verdict values — the device never derives its own. */
@@ -57,6 +64,8 @@ export interface VerifyResponse {
 
 export interface FaceVerifyClient {
   createEnrollment(req: CreateEnrollmentRequest): Promise<CreateEnrollmentResponse>;
+  verifyEnrollmentOtp(enrollmentId: string, otpCode: string): Promise<StageResponse>;
+  recordConsent(enrollmentId: string, consentVersion: string): Promise<StageResponse>;
   submitEnrollmentFace(enrollmentId: string, embeddingEnc: string): Promise<SubmitFaceResponse>;
   getEnrollmentStatusByNationalId(nationalId: string): Promise<EnrollmentStatusResponse>;
   verifyFace(nationalId: string, embeddingEnc: string): Promise<VerifyResponse>;
@@ -116,8 +125,14 @@ export function createFaceVerifyClient(): FaceVerifyClient {
     createEnrollment: (req) =>
       request('POST', '/api/v1/enrollments', {
         national_id: req.nationalId,
-        mobile: req.mobile,
-        consent_version: req.consentVersion,
+      }),
+    verifyEnrollmentOtp: (enrollmentId, otpCode) =>
+      request('POST', `/api/v1/enrollments/${encodeURIComponent(enrollmentId)}/otp`, {
+        otp_code: otpCode,
+      }),
+    recordConsent: (enrollmentId, consentVersion) =>
+      request('POST', `/api/v1/enrollments/${encodeURIComponent(enrollmentId)}/consent`, {
+        consent_version: consentVersion,
       }),
     submitEnrollmentFace: (enrollmentId, embeddingEnc) =>
       request('POST', `/api/v1/enrollments/${encodeURIComponent(enrollmentId)}/face`, {

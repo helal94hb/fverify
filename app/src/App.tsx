@@ -1,25 +1,21 @@
 /**
- * Root component + the flow state machine (design doc §3).
+ * Root component + the flow state machine (design doc §3, staged per the
+ * 2026-08-31 owner rulings).
  *
- * consent → identity → document → liveness → processing → verdict
+ * identity → otp → consent → document → liveness → processing → verdict
  *
- * CONSENT GATE (structural, tested): camera-bearing steps ('document',
- * 'liveness') exist only in states that carry a consentVersion, and only
- * CONSENT_ACCEPTED can introduce one — no consent, no camera screens, by
- * construction of the reducer below.
- *
- * Phase-A demo path in the processing step: extract the embedding on-device,
- * seal it, ensure an enrollment exists for the national ID, then ask the
- * backend for the verdict — the full enroll→verify pipeline in one run.
- * Production splits enrollment (once) from verification (anytime) into
- * separate sessions; that split is a product decision, not made here.
+ * STAGE GATES (structural, tested):
+ *  - the OTP step exists only after an enrollment id exists (the backend sent
+ *    a code to the T24-registered mobile — no anchor, no code);
+ *  - camera-bearing steps ('document', 'liveness') exist only in states
+ *    carrying a consentVersion, and only CONSENT_RECORDED can introduce one —
+ *    no consent, no camera, by construction.
  */
 
 import React, { useEffect, useReducer } from 'react';
 import { SafeAreaView, StyleSheet } from 'react-native';
 import {
   createFaceVerifyClient,
-  isEnrolled,
   type FaceVerifyClient,
   type Verdict,
 } from './api';
@@ -34,6 +30,7 @@ import { getLatestFaceCrop, TfliteEmbeddingExtractor } from './ml/tfliteExtracto
 import { DocumentCaptureScreen } from './screens/DocumentCaptureScreen';
 import { IdentityScreen, type IdentityInfo } from './screens/IdentityScreen';
 import { LivenessChallengeScreen } from './screens/LivenessChallengeScreen';
+import { OtpScreen } from './screens/OtpScreen';
 import { ProcessingScreen } from './screens/ProcessingScreen';
 import { VerdictScreen } from './screens/VerdictScreen';
 import { WelcomeConsentScreen } from './screens/WelcomeConsentScreen';
@@ -41,22 +38,27 @@ import { WelcomeConsentScreen } from './screens/WelcomeConsentScreen';
 // -- flow state machine (pure — fully jest-tested) -----------------------------
 
 export type FlowState =
-  | { step: 'consent' }
-  | { step: 'identity'; consentVersion: string }
-  | { step: 'document'; consentVersion: string; identity: IdentityInfo }
-  | { step: 'liveness'; consentVersion: string; identity: IdentityInfo }
-  | { step: 'processing'; consentVersion: string; identity: IdentityInfo }
+  | { step: 'identity' }
+  | { step: 'otp-request'; identity: IdentityInfo }
+  | { step: 'otp'; identity: IdentityInfo; enrollmentId: string; mobileHint: string }
+  | { step: 'consent'; identity: IdentityInfo; enrollmentId: string }
+  | { step: 'document'; identity: IdentityInfo; enrollmentId: string; consentVersion: string }
+  | { step: 'liveness'; identity: IdentityInfo; enrollmentId: string; consentVersion: string }
+  | { step: 'processing'; identity: IdentityInfo; enrollmentId: string; consentVersion: string }
   | {
       step: 'verdict';
       verdict: Verdict;
       reason: 'match' | 'liveness' | 'error';
-      consentVersion: string;
       identity: IdentityInfo;
+      enrollmentId: string;
+      consentVersion: string;
     };
 
 export type FlowAction =
-  | { type: 'CONSENT_ACCEPTED'; consentVersion: string }
   | { type: 'IDENTITY_SUBMITTED'; identity: IdentityInfo }
+  | { type: 'ENROLLMENT_CREATED'; enrollmentId: string; mobileHint: string }
+  | { type: 'OTP_VERIFIED' }
+  | { type: 'CONSENT_RECORDED'; consentVersion: string }
   | { type: 'DOCUMENT_CAPTURED' }
   | { type: 'LIVENESS_PASSED' }
   | { type: 'LIVENESS_EXHAUSTED' }
@@ -65,38 +67,76 @@ export type FlowAction =
   | { type: 'RETRY' }
   | { type: 'RESTART' };
 
-export const initialFlowState: FlowState = { step: 'consent' };
+export const initialFlowState: FlowState = { step: 'identity' };
 
 export function reduceFlow(state: FlowState, action: FlowAction): FlowState {
-  // RESTART is always legal — it is the only way back to the consent gate.
+  // RESTART is always legal — the only way back to the identity step.
   if (action.type === 'RESTART') return initialFlowState;
 
   switch (state.step) {
-    case 'consent':
-      // The ONLY transition out of the gate. Every camera action is ignored
-      // here — no consent, no camera.
-      return action.type === 'CONSENT_ACCEPTED'
-        ? { step: 'identity', consentVersion: action.consentVersion }
-        : state;
     case 'identity':
       return action.type === 'IDENTITY_SUBMITTED'
-        ? { step: 'document', consentVersion: state.consentVersion, identity: action.identity }
+        ? { step: 'otp-request', identity: action.identity }
+        : state;
+    case 'otp-request':
+      if (action.type === 'ENROLLMENT_CREATED') {
+        return {
+          step: 'otp',
+          identity: state.identity,
+          enrollmentId: action.enrollmentId,
+          mobileHint: action.mobileHint,
+        };
+      }
+      if (action.type === 'FLOW_ERROR') {
+        return {
+          step: 'verdict',
+          verdict: 'retry',
+          reason: 'error',
+          identity: state.identity,
+          enrollmentId: '',
+          consentVersion: '',
+        };
+      }
+      return state;
+    case 'otp':
+      return action.type === 'OTP_VERIFIED'
+        ? { step: 'consent', identity: state.identity, enrollmentId: state.enrollmentId }
+        : state;
+    case 'consent':
+      return action.type === 'CONSENT_RECORDED'
+        ? {
+            step: 'document',
+            identity: state.identity,
+            enrollmentId: state.enrollmentId,
+            consentVersion: action.consentVersion,
+          }
         : state;
     case 'document':
       return action.type === 'DOCUMENT_CAPTURED'
-        ? { step: 'liveness', consentVersion: state.consentVersion, identity: state.identity }
+        ? {
+            step: 'liveness',
+            identity: state.identity,
+            enrollmentId: state.enrollmentId,
+            consentVersion: state.consentVersion,
+          }
         : state;
     case 'liveness':
       if (action.type === 'LIVENESS_PASSED') {
-        return { step: 'processing', consentVersion: state.consentVersion, identity: state.identity };
+        return {
+          step: 'processing',
+          identity: state.identity,
+          enrollmentId: state.enrollmentId,
+          consentVersion: state.consentVersion,
+        };
       }
       if (action.type === 'LIVENESS_EXHAUSTED') {
         return {
           step: 'verdict',
           verdict: 'retry',
           reason: 'liveness',
-          consentVersion: state.consentVersion,
           identity: state.identity,
+          enrollmentId: state.enrollmentId,
+          consentVersion: state.consentVersion,
         };
       }
       return state;
@@ -106,37 +146,36 @@ export function reduceFlow(state: FlowState, action: FlowAction): FlowState {
           step: 'verdict',
           verdict: action.verdict,
           reason: 'match',
-          consentVersion: state.consentVersion,
           identity: state.identity,
+          enrollmentId: state.enrollmentId,
+          consentVersion: state.consentVersion,
         };
       }
       if (action.type === 'FLOW_ERROR') {
-        // Fail closed: any pipeline failure renders retry, never "verified".
         return {
           step: 'verdict',
           verdict: 'retry',
           reason: 'error',
-          consentVersion: state.consentVersion,
           identity: state.identity,
+          enrollmentId: state.enrollmentId,
+          consentVersion: state.consentVersion,
         };
       }
       return state;
     case 'verdict':
       return action.type === 'RETRY'
-        ? { step: 'liveness', consentVersion: state.consentVersion, identity: state.identity }
+        ? {
+            step: 'liveness',
+            identity: state.identity,
+            enrollmentId: state.enrollmentId,
+            consentVersion: state.consentVersion,
+          }
         : state;
   }
 }
 
 // -- processing pipeline --------------------------------------------------------
 
-/**
- * The default extractor: the REAL on-device model when it loads, the
- * deterministic stub when it cannot (emulator / jest / missing native
- * runtime). PHASE-A DEMO FALLBACK — the stub keeps the enroll→verify pipeline
- * exercisable end to end without a camera, but it has no biometric meaning;
- * production must hard-fail here instead of falling back (Phase B hardening).
- */
 async function resolveDefaultExtractor(): Promise<EmbeddingExtractor> {
   try {
     return await TfliteEmbeddingExtractor.load();
@@ -146,55 +185,64 @@ async function resolveDefaultExtractor(): Promise<EmbeddingExtractor> {
 }
 
 /**
- * Extract → seal → enroll-if-needed → verify. Any failure dispatches
- * FLOW_ERROR (fail closed). The frame argument is the freshest face crop
- * captured by the liveness frame processor (the runOnJS mailbox); when no
- * crop exists (stub path) the stub extractor still maps the placeholder
- * deterministically, and the real extractor refuses it — fail closed.
+ * Extract → seal → face upload (the enrollment is ALREADY stage-complete at
+ * this point) → verify. Any failure dispatches FLOW_ERROR (fail closed).
  */
 async function runProcessingPipeline(
   client: FaceVerifyClient,
   extractor: EmbeddingExtractor,
-  identity: IdentityInfo,
-  consentVersion: string,
+  enrollmentId: string,
+  nationalId: string,
 ): Promise<Verdict> {
   const embedding = await extractor.extractEmbedding(getLatestFaceCrop() ?? 'skeleton-frame');
   const embeddingEnc = seal(encodeEmbeddingForWire(embedding));
-  const status = await client.getEnrollmentStatusByNationalId(identity.nationalId);
-  if (!isEnrolled(status)) {
-    const { enrollment_id } = await client.createEnrollment({
-      nationalId: identity.nationalId,
-      mobile: identity.mobile,
-      consentVersion,
-    });
-    await client.submitEnrollmentFace(enrollment_id, embeddingEnc);
-  }
-  const { verdict } = await client.verifyFace(identity.nationalId, embeddingEnc);
+  const face = await client.submitEnrollmentFace(enrollmentId, embeddingEnc);
+  if (face.status !== 'enrolled') throw new Error(`face upload refused: ${face.status}`);
+  const { verdict } = await client.verifyFace(nationalId, embeddingEnc);
   return verdict;
 }
 
 // -- root component ---------------------------------------------------------------
 
 export interface AppProps {
-  /** Test seams — production resolves the real extractor (see resolveDefaultExtractor). */
   client?: FaceVerifyClient;
   extractor?: EmbeddingExtractor;
 }
 
 export default function App({ client, extractor }: AppProps): React.JSX.Element {
   const [state, dispatch] = useReducer(reduceFlow, initialFlowState);
+  const api = client ?? createFaceVerifyClient();
+
+  // enrollment request fires on entering otp-request
+  useEffect(() => {
+    if (state.step !== 'otp-request') return;
+    let cancelled = false;
+    api
+      .createEnrollment({ nationalId: state.identity.nationalId })
+      .then((res) => {
+        if (!cancelled) {
+          dispatch({
+            type: 'ENROLLMENT_CREATED',
+            enrollmentId: res.enrollment_id,
+            mobileHint: res.mobile_hint,
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) dispatch({ type: 'FLOW_ERROR' });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.step]);
 
   useEffect(() => {
     if (state.step !== 'processing') return;
     let cancelled = false;
     (extractor ? Promise.resolve(extractor) : resolveDefaultExtractor())
       .then((resolved) =>
-        runProcessingPipeline(
-          client ?? createFaceVerifyClient(),
-          resolved,
-          state.identity,
-          state.consentVersion,
-        ),
+        runProcessingPipeline(api, resolved, state.enrollmentId, state.identity.nationalId),
       )
       .then((verdict) => {
         if (!cancelled) dispatch({ type: 'VERDICT_RECEIVED', verdict });
@@ -205,20 +253,40 @@ export default function App({ client, extractor }: AppProps): React.JSX.Element 
     return () => {
       cancelled = true;
     };
-  }, [state, client, extractor]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.step]);
 
   return (
     <SafeAreaView style={styles.root}>
-      {state.step === 'consent' && (
-        <WelcomeConsentScreen
-          consentVersion={CONSENT_VERSION}
-          onAccept={() => dispatch({ type: 'CONSENT_ACCEPTED', consentVersion: CONSENT_VERSION })}
-          onDecline={() => dispatch({ type: 'RESTART' })}
-        />
-      )}
       {state.step === 'identity' && (
         <IdentityScreen
           onSubmit={(identity) => dispatch({ type: 'IDENTITY_SUBMITTED', identity })}
+        />
+      )}
+      {state.step === 'otp' && (
+        <OtpScreen
+          mobileHint={state.mobileHint}
+          onVerify={async (code) => {
+            await api.verifyEnrollmentOtp(state.enrollmentId, code);
+            dispatch({ type: 'OTP_VERIFIED' });
+          }}
+          onResend={async () => {
+            await api.createEnrollment({ nationalId: state.identity.nationalId });
+          }}
+        />
+      )}
+      {state.step === 'consent' && (
+        <WelcomeConsentScreen
+          consentVersion={CONSENT_VERSION}
+          onAccept={async () => {
+            try {
+              await api.recordConsent(state.enrollmentId, CONSENT_VERSION);
+              dispatch({ type: 'CONSENT_RECORDED', consentVersion: CONSENT_VERSION });
+            } catch {
+              dispatch({ type: 'FLOW_ERROR' });
+            }
+          }}
+          onDecline={() => dispatch({ type: 'RESTART' })}
         />
       )}
       {state.step === 'document' && (

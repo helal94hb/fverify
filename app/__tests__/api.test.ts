@@ -35,23 +35,17 @@ describe('FaceVerifyClient — call shapes', () => {
   const client = createFaceVerifyClient();
 
   it('POST /api/v1/enrollments sends identity + consent version (snake_case)', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(200, { enrollment_id: 'enr-1', status: 'created' }));
+    fetchMock.mockResolvedValue(
+      jsonResponse(201, { enrollment_id: 'enr-1', status: 'awaiting_otp', mobile_hint: '*** *** 000' }),
+    );
 
-    const res = await client.createEnrollment({
-      nationalId: 'TEST-ID-0001',
-      mobile: '+0000000000',
-      consentVersion: '1.0',
-    });
+    const res = await client.createEnrollment({ nationalId: 'TEST-ID-0001' });
 
-    expect(res).toEqual({ enrollment_id: 'enr-1', status: 'created' });
+    expect(res).toEqual({ enrollment_id: 'enr-1', status: 'awaiting_otp', mobile_hint: '*** *** 000' });
     const { url, init } = lastCall();
     expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments`);
     expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({
-      national_id: 'TEST-ID-0001',
-      mobile: '+0000000000',
-      consent_version: '1.0',
-    });
+    expect(JSON.parse(String(init.body))).toEqual({ national_id: 'TEST-ID-0001' });
     expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
   });
 
@@ -98,8 +92,10 @@ describe('FaceVerifyClient — call shapes', () => {
   });
 
   it('isEnrolled reads the backend shape ({enrolled}) and fails closed otherwise', () => {
-    expect(isEnrolled({ enrolled: true, enrolled_at: '2026-08-29T00:00:00Z' })).toBe(true);
-    expect(isEnrolled({ enrolled: false, enrolled_at: null })).toBe(false);
+    expect(
+      isEnrolled({ enrolled: true, enrolled_at: '2026-08-29T00:00:00Z', customer_id: 'c1', status: 'enrolled' }),
+    ).toBe(true);
+    expect(isEnrolled({ enrolled: false, enrolled_at: null, customer_id: null, status: null })).toBe(false);
   });
 });
 
