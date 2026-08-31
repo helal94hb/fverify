@@ -1,0 +1,106 @@
+# Agentys Workflows — Face Verification (fverify) Requirements & Spec
+
+**For:** the Agentys/playbook team · **Date:** 2026-08-31 · **Status:** ready to implement
+**Companion contracts:** `face-verify/INTEGRATION.md` (the fverify endpoint shapes), `program/design/FACE-VERIFICATION-DESIGN.md` (the product design)
+
+---
+
+## 0. The architecture you are implementing into
+
+```
+CHANNELS (banking mobile app · OLB · any future face app)
+   │  every request
+   ▼
+AGENTYS (the bank MW — these workflows)
+   ├─► fverify (blackbox IdP) — username, credential, face, OTP. Nothing else.
+   ├─► mobile DB identity_links — username ↔ customer_id (the linkage, YOU write it)
+   └─► T24 — customer data by customer_id
+```
+
+**The law for these workflows:**
+
+1. **fverify is a blackbox identity provider.** It knows ONLY user identity (username, password, face embedding, OTP). **Never send it a customer id, national id-as-customer-key, or any banking data** — it must never learn them.
+2. **The linkage (username ↔ T24 customer_id) is YOURS** — your workflows resolve it and write it into the mobile DB's `identity_links`, through the banking BFF's onboarding/provisioning path (the D-DB-8 store; fverify has no part in it).
+3. **No face image or template ever crosses Agentys** — images live device→(processing on device) and are discarded there. The only biometric on the wire is the **embedding, sealed** (`enc1:` RSA-OAEP-SHA-256, kid `fv-dev1`). Your run state must hold ciphertext only.
+4. **The channel drives capture; you drive order; fverify answers.** A workflow never supplies a biometric.
+
+## 1. Workflow A — Face Enrollment (`face_enrollment_v1`)
+
+Orchestrates a first-time face enrollment for a customer of the Bank.
+
+**Trigger inputs:** `{national_id, username, password, mobile}`
+
+**Stage 1 — resolve the customer (T24):** national_id → customer_id (the core's GET; the same lookup the onboarding flows use). Not a customer → end with the designed refusal. The REGISTERED mobile from T24 is the OTP destination when available; the trigger's mobile is the fallback for the PoC.
+
+**Stage 2 — register the identity (fverify):**
+`POST /api/v1/enrollments` `{username, password, mobile}` → `{enrollment_id, status:"awaiting_otp", mobile_hint}`.
+fverify mints the OTP and dispatches it (its SMS seam; today dev stub code `123456` — see §4).
+
+**Stage 3 — OTP proof (fverify):** the channel collects the code →
+`POST /api/v1/enrollments/{id}/otp` `{otp_code}` → `{status:"awaiting_consent"}`.
+422 `invalid-otp` → the designed retry state (single-use, 5 attempts, resend cooldown 429).
+
+**Stage 4 — consent (fverify):** the channel shows the consent copy (versioned) →
+`POST /api/v1/enrollments/{id}/consent` `{consent_version}` → `{status:"awaiting_face"}`.
+
+**Stage 5 — capture (channel):** document capture + guided liveness selfie on the device (see §3). The channel extracts the embedding ON-DEVICE and seals it (`enc1:`).
+
+**Stage 6 — face submit (fverify):**
+`POST /api/v1/enrollments/{id}/face` `{embedding_enc}` → `{status:"enrolled", enrolled_at}`.
+409 `invalid-stage` if any earlier stage is incomplete; 422 `invalid-embedding` on any payload that isn't the sealed compact vector.
+
+**Stage 7 — WRITE THE LINKAGE (yours, not fverify's):** on `enrolled`, write
+`username ↔ customer_id` into the mobile DB `identity_links` via the banking
+BFF's provisioning path (the same write the onboarding service performs at
+enrolment — D-DB-8). From this moment, sign-in by username resolves the customer.
+
+**Terminal state:** `completed`, outputs `{enrolled: true, username, customer_id, enrolled_at}`.
+
+## 2. Workflow B — Face Verification (`face_verification_v1`)
+
+Proves a person is physically present and matches an enrolled identity — usable as a standalone check or as the step-up authenticator inside another flow (transfer confirm, payee add).
+
+**Trigger inputs:** `{username}` (+ optional `intent_ref` when embedded as a step-up).
+
+**Stage 1 — enrolled check (fverify):**
+`GET /api/v1/enrollments/by-username/{username}/status` → `enrolled?` Not enrolled → the designed "enroll first" state (offer Workflow A).
+
+**Stage 2 — capture (channel):** fresh guided liveness challenge (randomized blink/turn sequence; a photo or screen cannot blink on cue). Channel extracts + seals the fresh embedding.
+
+**Stage 3 — match (fverify):**
+`POST /api/v1/verifications` `{username, embedding_enc}` → `{verdict, score, threshold}`.
+- `verified` → the run completes (or the step-up token may be issued by the calling flow).
+- `rejected` → the designed retry state; after **3** failures in 10 min fverify answers 429 `verification-locked` — map it to the designed lockout screen, not a generic error.
+
+**Terminal state:** `completed` with `{verified, score, threshold}` or the designed failure state.
+
+## 3. What the channel does (your screens)
+
+The capture UI belongs to the channel (banking mobile app) and is driven by YOUR stage outputs. Tested reference code is parked at `face-verify/app/PARKED.md` (consent / identity / OTP / document / liveness / verdict screens, the randomized liveness engine, the on-device embedding extractor with MobileFaceNet `mobilefacenet.tflite`, and the JS `enc1:` seal). It is reference code, not a shipped app — lift what you need; the flow state comes from the workflow, not from the app.
+
+## 4. The OTP dispatch seam (integration point, open item)
+
+fverify mints and verifies the OTP itself (owner ruling). DELIVERY rides its SMS seam (`send_otp_sms`) — today a dev stub (fixed code `123456`, nothing sent). Two ways to make it real, the team's choice:
+
+- **Provider direct** (Twilio/Egyptian gateway) inside fverify's seam, or
+- **Your SMS workflow** — fverify's seam calls your SMS-dispatch agent (the same one the banking OTP spec names), making Agentys the SMS path for both.
+
+Until one lands, the dev code keeps lanes and demos working.
+
+## 5. Errors you must map (never invent new shapes)
+
+From `INTEGRATION.md` — map each to its designed channel state:
+`not-a-customer` (404) · `otp-resend-cooldown` (429) · `invalid-otp` (422) · `invalid-stage` (409) · `invalid-embedding` (422) · `verification-locked` (429) · RFC 7807 envelope throughout.
+
+## 6. Hard rules checklist (the validator will test these)
+
+- [ ] No customer id ever appears in an fverify call or in fverify's store.
+- [ ] The linkage write (Stage A-7) happens in the mobile DB, never in fverify.
+- [ ] No image/frame/selfie/document crosses any node or sits in run state.
+- [ ] The embedding crosses sealed end-to-end; only fverify unseals (fv-dev1).
+- [ ] Verdicts come from fverify only — the workflow never derives its own match.
+- [ ] Lockout/cooldown problems map to designed screens, never generic errors.
+
+## 7. Reference endpoints (today, dev)
+
+Base: `https://desktop-jnpu3pf.taila9e3e5.ts.net` · the five routes + audit in `face-verify/INTEGRATION.md` (exact payload/response shapes — implement against that card, not from memory).
