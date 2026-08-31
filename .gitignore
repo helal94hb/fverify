@@ -5,3 +5,10 @@ __pycache__/
 .env
 /build/
 /dist/
+tools/
+
+# Android build outputs
+app/android/.gradle/
+app/android/app/build/
+app/android/build/
+app/android/local.properties
