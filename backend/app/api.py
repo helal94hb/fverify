@@ -5,7 +5,7 @@
   image-like is refused with a designed 422;
 - embeddings are encrypted (Fernet) before storage and never logged/returned;
 - the verdict is computed server-side;
-- unknown national_id is indistinguishable from a mismatch (anti-enumeration);
+- unknown username is indistinguishable from a mismatch (anti-enumeration);
 - verification attempts are capped (5 per 10 min) then a designed 429 lockout;
 - every attempt is audited (outcomes only).
 """
@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import crypto, match, otp, seal, sms, t24
+from . import crypto, match, otp, seal, sms
 from .config import Settings, get_settings
 from .errors import ProblemError, invalid_embedding
 from .models import AuditEvent, Enrollment, OtpRecord, utcnow
@@ -38,7 +38,9 @@ _IMAGE_LIKE_MARKERS = ("image", "selfie", "photo", "picture", "frame", "snapshot
 class EnrollRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    national_id: str = Field(min_length=1, max_length=64)
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=128)
+    mobile: str = Field(min_length=5, max_length=32)
 
 
 class EnrollResponse(BaseModel):
@@ -78,16 +80,14 @@ class FaceSubmitResponse(BaseModel):
 class StatusResponse(BaseModel):
     enrolled: bool
     enrolled_at: str | None
-    #: the T24 anchor (when resolved) + the enrollment's stage
-    customer_id: str | None = None
+    #: the enrollment's stage (never any customer id — this blackbox has none)
     status: str | None = None
 
 
 class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    national_id: str | None = Field(default=None, max_length=64)
-    customer_id: str | None = Field(default=None, max_length=64)
+    username: str = Field(min_length=3, max_length=64)
     embedding_enc: str = Field(min_length=1)
 
 
@@ -178,7 +178,7 @@ def _unseal_embedding(embedding_enc: str, request: Request) -> list[float]:
 
 async def _audit(
     session: AsyncSession,
-    national_id: str,
+    username: str,
     event: str,
     outcome: str,
     enrollment_id: str | None = None,
@@ -186,7 +186,7 @@ async def _audit(
 ) -> None:
     session.add(
         AuditEvent(
-            national_id=national_id,
+            username=username,
             enrollment_id=enrollment_id,
             event=event,
             outcome=outcome,
@@ -197,23 +197,12 @@ async def _audit(
 
 @router.post("/enrollments", status_code=201, response_model=EnrollResponse)
 async def create_enrollment(body: EnrollRequest, session: SessionDep, request: Request):
-    """Owner ruling 2026-08-31 — the identity anchor is the CORE: the national
-    id resolves via T24 to the real customer id + REGISTERED mobile, and
-    fverify's own OTP goes to that registered number. No T24 anchor, no
-    enrollment; nobody self-asserts a phone number."""
-    customer = await t24.resolve_customer(body.national_id)
-    if customer is None:
-        await _audit(session, body.national_id, "enrollment", "rejected", detail="not-a-customer")
-        await session.commit()
-        raise ProblemError(
-            404,
-            "not-a-customer",
-            "We could not find a customer for this national ID",
-            "Please check the number or visit a branch.",
-        )
-
+    """PURE IDENTITY registration (owner ruling 2026-08-31): this blackbox
+    knows ONLY user identity — username, credential, face, OTP. No customer
+    ids, no core banking, no T24 anywhere: the username ↔ customer_id linkage
+    lives in the mobile DB and is written through Agentys, never here."""
     existing = await session.scalar(
-        select(Enrollment).where(Enrollment.national_id == body.national_id)
+        select(Enrollment).where(Enrollment.username == body.username)
     )
     if existing is not None:
         # Idempotent — but a resend while awaiting the OTP respects the cooldown.
@@ -240,9 +229,9 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
         )
 
     enrollment = Enrollment(
-        national_id=body.national_id,
-        customer_id=customer["customer_id"],
-        mobile=customer["mobile"],
+        username=body.username,
+        password_hash=otp.hash_secret(body.password),
+        mobile=body.mobile,
         status="awaiting_otp",
     )
     session.add(enrollment)
@@ -251,7 +240,7 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
     hint = await sms.send_otp_sms(enrollment.mobile, code)
     await _audit(
         session,
-        national_id=body.national_id,
+        username=body.username,
         enrollment_id=enrollment.id,
         event="enrollment",
         outcome="created",
@@ -277,7 +266,7 @@ async def verify_enrollment_otp(
         )
     if not await otp.verify(session, enrollment.id, body.otp_code):
         await _audit(
-            session, enrollment.national_id, enrollment_id=enrollment.id,
+            session, enrollment.username, enrollment_id=enrollment.id,
             event="otp", outcome="rejected",
         )
         await session.commit()
@@ -289,7 +278,7 @@ async def verify_enrollment_otp(
         )
     enrollment.status = "awaiting_consent"
     await _audit(
-        session, enrollment.national_id, enrollment_id=enrollment.id,
+        session, enrollment.username, enrollment_id=enrollment.id,
         event="otp", outcome="verified",
     )
     await session.commit()
@@ -311,7 +300,7 @@ async def record_consent(enrollment_id: str, body: ConsentRequest, session: Sess
     enrollment.consent_at = utcnow()
     enrollment.status = "awaiting_face"
     await _audit(
-        session, enrollment.national_id, enrollment_id=enrollment.id,
+        session, enrollment.username, enrollment_id=enrollment.id,
         event="enrollment", outcome="consent-recorded",
         detail=f"consent_version={body.consent_version}",
     )
@@ -353,7 +342,7 @@ async def submit_face(
     enrollment.enrolled_at = utcnow()
     await _audit(
         session,
-        national_id=enrollment.national_id,
+        username=enrollment.username,
         enrollment_id=enrollment.id,
         event="face_submission",
         outcome="enrolled",
@@ -362,22 +351,20 @@ async def submit_face(
     return FaceSubmitResponse(status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat())
 
 
-@router.get("/enrollments/by-national-id/{national_id}/status", response_model=StatusResponse)
-async def enrollment_status(national_id: str, session: SessionDep):
+@router.get("/enrollments/by-username/{username}/status", response_model=StatusResponse)
+async def enrollment_status(username: str, session: SessionDep):
     enrollment = await session.scalar(
-        select(Enrollment).where(Enrollment.national_id == national_id)
+        select(Enrollment).where(Enrollment.username == username)
     )
     if enrollment is None or enrollment.status != "enrolled":
         return StatusResponse(
             enrolled=False,
             enrolled_at=None,
-            customer_id=enrollment.customer_id if enrollment else None,
             status=enrollment.status if enrollment else None,
         )
     return StatusResponse(
         enrolled=True,
         enrolled_at=enrollment.enrolled_at.isoformat(),
-        customer_id=enrollment.customer_id,
         status=enrollment.status,
     )
 
@@ -385,18 +372,7 @@ async def enrollment_status(national_id: str, session: SessionDep):
 @router.post("/verifications", response_model=VerifyResponse)
 async def verify(body: VerifyRequest, session: SessionDep, request: Request, settings: SettingsDep):
     threshold = settings.match_threshold
-
-    # Exactly one identity key (owner ruling 2026-08-31 — the T24 anchor is a
-    # first-class key beside the national id).
-    key = body.national_id or body.customer_id
-    if key is None or (body.national_id and body.customer_id):
-        raise ProblemError(
-            422,
-            "invalid-identity",
-            "Provide exactly one identity key",
-            "national_id OR customer_id.",
-        )
-    audit_id = key
+    audit_id = body.username
 
     # Sealed-in-transit is enforced uniformly, before any identity lookup.
     try:
@@ -412,7 +388,7 @@ async def verify(body: VerifyRequest, session: SessionDep, request: Request, set
     cutoff = utcnow() - timedelta(seconds=settings.verify_window_seconds)
     recent_failures = await session.scalar(
         select(func.count(AuditEvent.id)).where(
-            AuditEvent.national_id == audit_id,
+            AuditEvent.username == audit_id,
             AuditEvent.event == "verification",
             AuditEvent.outcome == "rejected",
             AuditEvent.created_at >= cutoff,
@@ -428,20 +404,12 @@ async def verify(body: VerifyRequest, session: SessionDep, request: Request, set
             "Too many failed verification attempts. Try again later.",
         )
 
-    if body.national_id:
-        enrollment = await session.scalar(
-            select(Enrollment).where(
-                Enrollment.national_id == body.national_id,
-                Enrollment.status == "enrolled",
-            )
+    enrollment = await session.scalar(
+        select(Enrollment).where(
+            Enrollment.username == body.username,
+            Enrollment.status == "enrolled",
         )
-    else:
-        enrollment = await session.scalar(
-            select(Enrollment).where(
-                Enrollment.customer_id == body.customer_id,
-                Enrollment.status == "enrolled",
-            )
-        )
+    )
 
     if enrollment is None or enrollment.embedding_encrypted is None:
         # Anti-enumeration: identical response shape to a genuine mismatch.
@@ -475,7 +443,7 @@ async def audit_recent(session: SessionDep, limit: int = 50):
         "events": [
             {
                 "id": row.id,
-                "national_id": row.national_id,
+                "username": row.username,
                 "enrollment_id": row.enrollment_id,
                 "event": row.event,
                 "outcome": row.outcome,

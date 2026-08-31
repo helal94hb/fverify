@@ -73,19 +73,10 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     # 2026-08-31: 0.80).
     match_threshold: float = 0.8
 
-    # Verification attempt cap: max failed attempts per national_id per window
+    # Verification attempt cap: max failed attempts per username per window
     # (owner ruling 2026-08-31: 3 retries, then the lockout).
     verify_max_attempts: int = 3
     verify_window_seconds: int = 600
-
-    # --- T24 anchor (owner ruling 2026-08-31): enrollment resolves the ----
-    # national id through the CORE — national id → customer id + REGISTERED
-    # mobile. The customer never self-asserts the phone number.
-    #: OFF = the stub fixture serves the demo customer; ON = the live GET
-    #: against the core's customer lookup (env-only base URL + key).
-    t24_live: bool = False
-    t24_base_url: str = ""
-    t24_api_key: str = ""
 
     # --- fverify's own OTP (owner ruling 2026-08-31 — this service mints ----
     # and verifies; dispatch rides the SMS seam, dev stub until a provider

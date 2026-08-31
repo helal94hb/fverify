@@ -44,22 +44,26 @@ on-device face embedding      embedding  cosine match → VERDICT
 
 ## 3. The two flows
 
-**Enrollment (once, staged — owner rulings 2026-08-31):**
-national ID → the backend resolves it against the CORE (T24 GET: customer id +
-the REGISTERED mobile — nobody self-asserts the phone) → **fverify's own OTP**
-to that registered number (single-use, attempt-capped, cooldown on resend) →
-explicit consent (versioned, *before* the camera) → document capture → guided
-liveness selfie (randomized blink / turn-left / turn-right challenges — a photo
-or a screen cannot blink on cue) → embedding extracted on-device → sealed →
-backend stores it encrypted → `enrolled`. The record binds T24 customer id +
-national id + embedding.
+**fverify is a blackbox identity provider** — it knows ONLY user identity:
+username, password, the face embedding, OTP. **No customer ids, no banking
+data, no T24 knowledge** (owner ruling 2026-08-31). The username ↔ customer_id
+linkage lives in the mobile DB (`identity_links`) and is written THROUGH
+AGENTYS — never through this service.
+
+**Enrollment (once, staged):**
+username + password + mobile → **fverify's own OTP** to the registered mobile
+(single-use, attempt-capped, cooldown on resend) → explicit consent (versioned,
+*before* the camera) → document capture → guided liveness selfie (randomized
+blink / turn-left / turn-right challenges — a photo or a screen cannot blink on
+cue) → embedding extracted on-device → sealed → backend stores it encrypted →
+`enrolled`. The record binds username + credential + embedding — identity only.
 
 **Verification (anytime):**
-identify (national ID **or** T24 customer id) → fresh liveness challenge loop →
-fresh embedding → sealed → backend matches vs the enrolled record → `verified`
-/ `rejected` with a score (threshold **0.80**). **3** failures in 10 minutes →
-designed lockout. Every attempt is audited (outcomes only — no embeddings in
-the audit trail).
+identify by username → fresh liveness challenge loop → fresh embedding →
+sealed → backend matches vs the enrolled record → `verified` / `rejected`
+with a score (threshold **0.80**). **3** failures in 10 minutes → designed
+lockout. Every attempt is audited (outcomes only — no embeddings in the audit
+trail).
 
 ## 4. Data rules (non-negotiable)
 
@@ -96,9 +100,9 @@ So the integration pattern is:
 ## 7. Status — what exists vs what's next
 
 **Built and green (today):**
-- Backend complete: the T24-anchored staged enrollment + fverify's own OTP — 18 tests green
-  (T24 anchor, OTP single-use/caps/cooldown, stage gates, threshold 0.80, 3-retry lockout,
-  both identity keys), ruff clean.
+- Backend complete: the pure-identity staged enrollment (username + credential + own OTP) —
+  16 tests green (OTP single-use/caps/cooldown, stage gates, threshold 0.80, 3-retry lockout,
+  sealed-only intake, encrypted-at-rest proof, no-customer-id invariant), ruff clean.
 - App skeleton complete: 38 jest tests green (liveness engine, seal envelope,
   API client, flow state machine), typecheck + lint clean.
 - Cross-language interop proof vendored: the app's JS seal opens on the
@@ -130,7 +134,9 @@ cd app && npm install && npx jest       # 38 green
 
 ## 9. Open decisions for the Architect (from the design doc)
 
-1. ~~Identity anchor~~ **RULED (2026-08-31): T24 GET** (customer id + registered mobile), OTP owned by fverify.
+1. ~~Identity anchor~~ **RULED (2026-08-31): fverify is a blackbox IdP — identity only
+   (username/credential/face/OTP); the username ↔ customer_id linkage lives in the mobile DB
+   via Agentys.** OTP owned by fverify.
 2. ~~Threshold + retry~~ **RULED (2026-08-31): 0.80, 3 retries.**
 3. Consent copy, retention window, delete-my-face path (PDPL class).
 4. Play Integrity / App Attest hardening in phase 2 (recommended).

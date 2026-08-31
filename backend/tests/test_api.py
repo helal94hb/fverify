@@ -1,8 +1,9 @@
 """End-to-end API tests for the standalone face-verification backend.
 
-The staged enrollment (owner rulings 2026-08-31): national id → T24 anchor
-(customer id + registered mobile) → fverify's own OTP → consent → face.
-Verifications key by national_id OR customer_id; threshold 0.80, 3 retries.
+PURE IDENTITY (owner ruling 2026-08-31): this blackbox knows ONLY user
+identity — username, credential, face, OTP. No customer ids, no core banking,
+no T24 anywhere; the username ↔ customer_id linkage lives in the mobile DB
+and is written through Agentys, never here.
 """
 
 import json
@@ -10,7 +11,9 @@ import sqlite3
 
 from app import crypto
 
-DEMO_ID = "12345678901234"  # the t24 stub fixture's known customer
+DEMO_USER = "face.user"
+DEMO_MOBILE = "01000000000"
+DEMO_PASSWORD = "Sup3r#Secret1"
 DEV_OTP = "123456"  # settings.otp_stub_code
 
 VEC_A = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
@@ -18,8 +21,11 @@ VEC_A_CLOSE = [0.101, 0.199, 0.301, 0.4, 0.5, 0.6, 0.7, 0.8]
 VEC_ORTHOGONAL = [0.8, -0.7, 0.6, -0.5, 0.4, -0.3, 0.2, -0.1]
 
 
-def _enroll(harness, national_id=DEMO_ID):
-    return harness.client.post("/api/v1/enrollments", json={"national_id": national_id})
+def _enroll(harness, username=DEMO_USER, mobile=DEMO_MOBILE):
+    return harness.client.post(
+        "/api/v1/enrollments",
+        json={"username": username, "password": DEMO_PASSWORD, "mobile": mobile},
+    )
 
 
 def _otp(harness, enrollment_id, code=DEV_OTP):
@@ -41,38 +47,30 @@ def _face(harness, enrollment_id, vec=VEC_A):
     )
 
 
-def _enroll_with_face(harness, national_id=DEMO_ID, vec=VEC_A):
-    enrollment_id = _enroll(harness, national_id).json()["enrollment_id"]
+def _enroll_with_face(harness, username=DEMO_USER, vec=VEC_A):
+    enrollment_id = _enroll(harness, username).json()["enrollment_id"]
     assert _otp(harness, enrollment_id).status_code == 200
     assert _consent(harness, enrollment_id).status_code == 200
     assert _face(harness, enrollment_id, vec).status_code == 200
     return enrollment_id
 
 
-def _verify(harness, vec, national_id=None, customer_id=None):
-    body = {"embedding_enc": harness.seal(vec)}
-    if national_id:
-        body["national_id"] = national_id
-    if customer_id:
-        body["customer_id"] = customer_id
-    return harness.client.post("/api/v1/verifications", json=body)
+def _verify(harness, vec, username=DEMO_USER):
+    return harness.client.post(
+        "/api/v1/verifications",
+        json={"username": username, "embedding_enc": harness.seal(vec)},
+    )
 
 
-# --- the staged enrollment (T24 anchor + own OTP) ------------------------------
+# --- registration (pure identity) ----------------------------------------------
 
 
-def test_enrollment_resolves_the_t24_anchor_and_sends_otp_to_the_registered_mobile(harness):
+def test_enrollment_registers_pure_identity_and_sends_otp(harness):
     resp = _enroll(harness)
     assert resp.status_code == 201
     body = resp.json()
     assert body["status"] == "awaiting_otp"
     assert body["mobile_hint"].startswith("***"), "the response carries the masked hint only"
-
-
-def test_unknown_national_id_is_not_a_customer_and_no_enrollment_opens(harness):
-    resp = _enroll(harness, "99999999999999")
-    assert resp.status_code == 404
-    assert resp.json()["type"] == "urn:face-verify:problem:not-a-customer"
 
 
 def test_otp_must_verify_before_any_later_step(harness):
@@ -124,29 +122,26 @@ def test_face_before_the_stages_is_refused(harness):
 # --- the full journey + the verdict --------------------------------------------
 
 
-def test_full_journey_anchor_otp_consent_face_status_verify(harness):
+def test_full_journey_register_otp_consent_face_status_verify(harness):
     _enroll_with_face(harness)
 
-    status = harness.client.get(f"/api/v1/enrollments/by-national-id/{DEMO_ID}/status")
+    status = harness.client.get(f"/api/v1/enrollments/by-username/{DEMO_USER}/status")
     assert status.status_code == 200
     body = status.json()
     assert body["enrolled"] is True
-    assert body["customer_id"] == "cust-000123"
     assert body["status"] == "enrolled"
+    assert "customer_id" not in body, "this blackbox has no customer ids to leak"
 
-    verify = _verify(harness, VEC_A_CLOSE, national_id=DEMO_ID)
+    verify = _verify(harness, VEC_A_CLOSE)
     assert verify.status_code == 200
     result = verify.json()
     assert result["verdict"] == "verified"
     assert result["score"] >= result["threshold"] == 0.8
 
-    by_customer = _verify(harness, VEC_A_CLOSE, customer_id="cust-000123")
-    assert by_customer.json()["verdict"] == "verified"
-
 
 def test_mismatch_is_rejected(harness):
     _enroll_with_face(harness)
-    verify = _verify(harness, VEC_ORTHOGONAL, national_id=DEMO_ID)
+    verify = _verify(harness, VEC_ORTHOGONAL)
     assert verify.status_code == 200
     result = verify.json()
     assert result["verdict"] == "rejected"
@@ -155,8 +150,8 @@ def test_mismatch_is_rejected(harness):
 
 def test_unknown_identity_is_indistinguishable_from_mismatch(harness):
     _enroll_with_face(harness)
-    unknown = _verify(harness, VEC_ORTHOGONAL, national_id="NID-UNKNOWN")
-    mismatch = _verify(harness, VEC_ORTHOGONAL, national_id=DEMO_ID)
+    unknown = _verify(harness, VEC_ORTHOGONAL, username="someone.else")
+    mismatch = _verify(harness, VEC_ORTHOGONAL)
     assert unknown.status_code == 200
     assert set(unknown.json().keys()) == set(mismatch.json().keys())
     assert unknown.json()["verdict"] == mismatch.json()["verdict"] == "rejected"
@@ -166,25 +161,18 @@ def test_unknown_identity_is_indistinguishable_from_mismatch(harness):
 def test_lockout_after_three_failed_attempts(harness):
     _enroll_with_face(harness)
     for _ in range(3):
-        resp = _verify(harness, VEC_ORTHOGONAL, national_id=DEMO_ID)
+        resp = _verify(harness, VEC_ORTHOGONAL)
         assert resp.status_code == 200
         assert resp.json()["verdict"] == "rejected"
 
-    locked = _verify(harness, VEC_ORTHOGONAL, national_id=DEMO_ID)
+    locked = _verify(harness, VEC_ORTHOGONAL)
     assert locked.status_code == 429
     assert locked.headers["content-type"].startswith("application/problem+json")
     assert locked.json()["type"] == "urn:face-verify:problem:verification-locked"
 
     # Even a CORRECT embedding is refused while locked out (fail-closed).
-    still_locked = _verify(harness, VEC_A, national_id=DEMO_ID)
+    still_locked = _verify(harness, VEC_A)
     assert still_locked.status_code == 429
-
-
-def test_verification_requires_exactly_one_identity_key(harness):
-    both = _verify(harness, VEC_A, national_id=DEMO_ID, customer_id="cust-000123")
-    assert both.status_code == 422
-    neither = _verify(harness, VEC_A)
-    assert neither.status_code == 422
 
 
 # --- the guards that must never regress ----------------------------------------
@@ -202,14 +190,15 @@ def test_unsealed_embedding_is_refused(harness):
     assert face.json()["type"] == "urn:face-verify:problem:invalid-embedding"
 
     # And the enrollment must NOT have progressed.
-    status = harness.client.get(f"/api/v1/enrollments/by-national-id/{DEMO_ID}/status")
+    status = harness.client.get(f"/api/v1/enrollments/by-username/{DEMO_USER}/status")
     assert status.json()["enrolled"] is False
 
 
 def test_extra_image_like_fields_rejected_everywhere(harness):
     resp = harness.client.post(
         "/api/v1/enrollments",
-        json={"national_id": DEMO_ID, "selfie_base64": "AAAA"},
+        json={"username": DEMO_USER, "password": DEMO_PASSWORD, "mobile": DEMO_MOBILE,
+              "selfie_base64": "AAAA"},
     )
     assert resp.status_code == 422
 
@@ -252,12 +241,13 @@ def test_embedding_encrypted_at_rest(harness):
 
 def test_embedding_never_returned_and_audit_has_outcomes_only(harness):
     _enroll_with_face(harness)
-    _verify(harness, VEC_A, national_id=DEMO_ID)
+    _verify(harness, VEC_A)
 
     audit = harness.client.get("/api/v1/audit/recent")
     assert audit.status_code == 200
     events = audit.json()["events"]
     assert {e["outcome"] for e in events} >= {"created", "verified", "enrolled"}
+    assert all("username" in e for e in events)
 
     # No endpoint response may contain the embedding (as numbers or JSON text).
     blob = json.dumps(audit.json())

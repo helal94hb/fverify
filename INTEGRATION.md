@@ -1,4 +1,4 @@
-# Face-Verify — Integration Card (for Agentys / any orchestrator)
+# Face-Verify — Integration Card (for Agentys only)
 
 **Public base URL (dev, via Tailscale Funnel):**
 `https://desktop-jnpu3pf.taila9e3e5.ts.net`
@@ -6,24 +6,25 @@
 All routes are under `/api/v1`. Errors are RFC 7807 `application/problem+json`
 (client-safe titles only — never internals).
 
-> Hard rules for any caller: face IMAGES never cross this API (only sealed
-> embedding vectors), embeddings arrive `enc1:`-sealed (RSA-OAEP-SHA-256, the
-> platform's envelope format — this service's pair is kid `fv-dev1`), and an
-> unknown identity is INDISTINGUISHABLE from a mismatch by design
-> (anti-enumeration).
+> **THIS SERVICE IS A BLACKBOX IDENTITY PROVIDER.** It knows ONLY user
+> identity — username, credential (password), face embedding, OTP. It has NO
+> customer ids, NO banking data, NO T24 knowledge. The username ↔ customer_id
+> linkage lives in the mobile DB (`identity_links`) and is written THROUGH
+> AGENTYS — never through this service. (Owner ruling, 2026-08-31.)
+>
+> Caller rules: this surface is server-to-server for Agentys nodes only; face
+> IMAGES never cross it (only sealed embedding vectors, `enc1:` RSA-OAEP, kid
+> `fv-dev1`); unknown identities are INDISTINGUISHABLE from mismatches by design.
 
-## The staged enrollment (owner rulings 2026-08-31)
+## Registration (staged: identity → OTP → consent → face)
 
-national id → **T24 anchor** (customer id + REGISTERED mobile — the customer
-never self-asserts the phone) → **fverify's own OTP** → consent → face.
-
-### POST /api/v1/enrollments — open + send the OTP
+### POST /api/v1/enrollments — register + send the OTP
 ```json
-REQ  {"national_id": "12345678901234"}
+REQ  {"username": "face.user", "password": "••••••••", "mobile": "01000000000"}
 RESP 201 {"enrollment_id": "<id>", "status": "awaiting_otp", "mobile_hint": "*** *** 000"}
 ```
-404 `not-a-customer` when the national id is not a bank customer. Re-enrolling
-while awaiting the OTP respects a resend cooldown (429 `otp-resend-cooldown`).
+Idempotent per username; resend while awaiting the OTP respects the cooldown
+(429 `otp-resend-cooldown`).
 
 ### POST /api/v1/enrollments/{enrollment_id}/otp — prove the code
 ```json
@@ -49,23 +50,22 @@ before it is stored.
 
 ## Status + verification
 
-### GET /api/v1/enrollments/by-national-id/{national_id}/status
+### GET /api/v1/enrollments/by-username/{username}/status
 ```json
-RESP 200 {"enrolled": true|false, "enrolled_at": "<iso8601>"|null,
-          "customer_id": "cust-000123"|null, "status": "<stage>"|null}
+RESP 200 {"enrolled": true|false, "enrolled_at": "<iso8601>"|null, "status": "<stage>"|null}
 ```
 
 ### POST /api/v1/verifications — the match verdict (server-side, always)
 ```json
-REQ  {"national_id": "12345678901234", "embedding_enc": "enc1:<sealed fresh capture>"}
-  OR {"customer_id": "cust-000123", "embedding_enc": "enc1:<...>"}   (exactly ONE key)
+REQ  {"username": "face.user", "embedding_enc": "enc1:<sealed fresh capture>"}
 RESP 200 {"verdict": "verified"|"rejected", "score": 0.0-1.0, "threshold": 0.8}
 ```
 - Owner rulings: threshold **0.80**, retries capped at **3** failed attempts
-  per identity per 10 minutes → designed 429 `verification-locked`.
-- An unknown identity returns the SAME 200 + `rejected` shape as a real
+  per username per 10 minutes → designed 429 `verification-locked`.
+- An unknown username returns the SAME 200 + `rejected` shape as a real
   mismatch (no oracle).
 
 ## GET /api/v1/audit/recent?limit=50
-Ops proof surface — outcomes only (enrolled / verified / rejected / locked /
-otp outcomes), timestamps, identity key. No embeddings anywhere in this service.
+Ops proof surface — outcomes only (created / verified / rejected / locked /
+otp outcomes), timestamps, **username**. No embeddings, no customer ids,
+nothing outside identity.

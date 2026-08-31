@@ -24,10 +24,12 @@ class Enrollment(Base):
     __tablename__ = "enrollments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    national_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    #: the T24-anchored identity (owner ruling 2026-08-31) — the customer id
-    #: from the core and the REGISTERED mobile (never user-asserted).
-    customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    #: PURE IDENTITY (owner ruling 2026-08-31): this blackbox knows ONLY user
+    #: identity — username, credential, face, OTP. No customer ids, no core
+    #: banking, no T24 anywhere in this schema; the username ↔ customer_id
+    #: linkage lives in the mobile DB and is written through Agentys.
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(128))
     mobile: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(16), default="awaiting_otp")
 
@@ -49,7 +51,7 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    national_id: Mapped[str] = mapped_column(String(64))
+    username: Mapped[str] = mapped_column(String(64))
     enrollment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     event: Mapped[str] = mapped_column(String(32))  # enrollment | face | verification | otp
     # created | enrolled | verified | rejected | locked
@@ -58,7 +60,7 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
-Index("ix_audit_national_time", AuditEvent.national_id, AuditEvent.created_at)
+Index("ix_audit_user_time", AuditEvent.username, AuditEvent.created_at)
 
 
 class OtpRecord(Base):
