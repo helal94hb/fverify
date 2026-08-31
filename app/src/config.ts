@@ -8,11 +8,13 @@
  */
 
 /**
- * Phase-A dev default. The standalone backend listens on 8400 in dev.
- * Production wiring lands with deployment config — there is intentionally no
- * other environment mechanism in the skeleton.
+ * Dev default for the on-device run: the emulator reaches the HOST's
+ * standalone backend (127.0.0.1:8400 on the workstation) through the Android
+ * emulator's host alias 10.0.2.2. Production wiring lands with deployment
+ * config — there is intentionally no other environment mechanism in the
+ * skeleton.
  */
-export const API_BASE_URL = 'http://127.0.0.1:8400';
+export const API_BASE_URL = 'http://10.0.2.2:8400';
 
 /**
  * Version of the consent copy the customer accepts. Sent to the backend with
