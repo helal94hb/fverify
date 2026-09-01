@@ -104,3 +104,36 @@ From `INTEGRATION.md` — map each to its designed channel state:
 ## 7. Reference endpoints (today, dev)
 
 Base: `https://desktop-jnpu3pf.taila9e3e5.ts.net` · the five routes + audit in `face-verify/INTEGRATION.md` (exact payload/response shapes — implement against that card, not from memory).
+
+---
+
+## Q&A (team round 1, 2026-09-02)
+
+**Q1. Do we get the face embeddings from fverify or the mobile app?**
+The embedding is PRODUCED on the device (the channel captures + seals it), but
+it FLOWS through Agentys — never app→fverify directly. The face-submit node
+forwards the sealed blob; fverify unseals. (§1 Stage 6 read as if fverify faced
+the channel — corrected: channels never call systems.)
+
+**Q2. Workflow A's trigger inputs come from the sign-up form, sent directly to
+Agentys?**
+Yes — the channel collects the form and triggers the workflow. Rule on top:
+the `password` rides SEALED even in the trigger, and each payload seals to its
+ULTIMATE VALIDATOR's public key — enrollment's password seals to fv-dev1 (it
+ends at fverify); sign-in's password seals to dev1 (it ends at the validator
+on the mobile DB).
+
+**Q3. OTP: does fverify mint AND dispatch the SMS? Or does Agentys call a
+separate dispatch service, wait for the app to collect the code, then send it
+to fverify's /otp?**
+fverify ALWAYS mints and ALWAYS validates — never leaves it. The target shape
+is your second reading: fverify's dispatch seam calls the Agentys SMS workflow
+(your build) → SMS goes out → the channel collects the code from the user →
+your OTP-verify node calls fverify's /otp to validate. Until the SMS workflow
+lands, fverify runs the dev stub (fixed code 123456).
+
+**Q4. Is fverify an identity provider that replaces HID?**
+For this platform: yes — credentials + face + OTP, with the linkage in the
+mobile DB via your workflows. Whether it institutionally replaces the Bank's
+HID estate is the Bank's decision; for our build, fverify IS the IdP and HID
+becomes optional rather than load-bearing.
