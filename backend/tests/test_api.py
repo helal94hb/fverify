@@ -4,6 +4,10 @@ PURE IDENTITY (owner ruling 2026-08-31): this blackbox knows ONLY user
 identity — username, credential, face, OTP. No customer ids, no core banking,
 no T24 anywhere; the username ↔ customer_id linkage lives in the mobile DB
 and is written through Agentys, never here.
+
+OTP dispatch refactor (2026-09-02): OTP generation is a dedicated endpoint
+(/otp/generate) that returns an AES-256-GCM encrypted code for Agentys.
+OTP verification accepts the user's code sealed in an enc1: envelope.
 """
 
 import json
@@ -14,12 +18,15 @@ from app import crypto
 DEMO_USER = "face.user"
 DEMO_MOBILE = "01000000000"
 DEMO_PASSWORD = "Sup3r#Secret1"
-DEV_OTP = "123456"  # settings.otp_stub_code
 
 VEC_A = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 VEC_A_CLOSE = [0.101, 0.199, 0.301, 0.4, 0.5, 0.6, 0.7, 0.8]
 VEC_ORTHOGONAL = [0.8, -0.7, 0.6, -0.5, 0.4, -0.3, 0.2, -0.1]
 
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
 
 def _enroll(harness, username=DEMO_USER, mobile=DEMO_MOBILE):
     return harness.client.post(
@@ -28,9 +35,16 @@ def _enroll(harness, username=DEMO_USER, mobile=DEMO_MOBILE):
     )
 
 
-def _otp(harness, enrollment_id, code=DEV_OTP):
+def _otp_generate(harness, enrollment_id):
     return harness.client.post(
-        f"/api/v1/enrollments/{enrollment_id}/otp", json={"otp_code": code}
+        f"/api/v1/enrollments/{enrollment_id}/otp/generate",
+    )
+
+
+def _otp_verify(harness, enrollment_id, otp_code_enc):
+    return harness.client.post(
+        f"/api/v1/enrollments/{enrollment_id}/otp",
+        json={"otp_code_enc": otp_code_enc},
     )
 
 
@@ -47,9 +61,21 @@ def _face(harness, enrollment_id, vec=VEC_A):
     )
 
 
+def _generate_and_verify_otp(harness, enrollment_id):
+    """Generate an OTP, decrypt it (as Agentys would), seal it (as the mobile
+    app would), and verify it against fverify."""
+    gen = _otp_generate(harness, enrollment_id)
+    assert gen.status_code == 200, gen.json()
+    code = harness.decrypt_otp(gen.json()["ciphered_otp"])
+    sealed_code = harness.seal_otp(code)
+    verify = _otp_verify(harness, enrollment_id, sealed_code)
+    assert verify.status_code == 200, verify.json()
+    return verify
+
+
 def _enroll_with_face(harness, username=DEMO_USER, vec=VEC_A):
     enrollment_id = _enroll(harness, username).json()["enrollment_id"]
-    assert _otp(harness, enrollment_id).status_code == 200
+    _generate_and_verify_otp(harness, enrollment_id)
     assert _consent(harness, enrollment_id).status_code == 200
     assert _face(harness, enrollment_id, vec).status_code == 200
     return enrollment_id
@@ -65,61 +91,129 @@ def _verify(harness, vec, username=DEMO_USER):
 # --- registration (pure identity) ----------------------------------------------
 
 
-def test_enrollment_registers_pure_identity_and_sends_otp(harness):
+def test_enrollment_registers_pure_identity(harness):
     resp = _enroll(harness)
     assert resp.status_code == 201
     body = resp.json()
     assert body["status"] == "awaiting_otp"
     assert body["mobile_hint"].startswith("***"), "the response carries the masked hint only"
+    # The registration endpoint must NOT return any OTP-related field.
+    assert "ciphered_otp" not in body
+    assert "otp" not in body
+
+
+def test_enrollment_is_idempotent(harness):
+    first = _enroll(harness)
+    second = _enroll(harness)
+    assert second.status_code == 201
+    assert second.json()["enrollment_id"] == first.json()["enrollment_id"]
+
+
+# --- OTP generation (new endpoint) -------------------------------------------
+
+
+def test_otp_generate_returns_valid_aes256gcm_token(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    gen = _otp_generate(harness, enrollment_id)
+    assert gen.status_code == 200
+    body = gen.json()
+    assert body["ciphered_otp"].startswith("aes256gcm:")
+    assert body["mobile"] == DEMO_MOBILE
+    assert body["mobile_hint"].startswith("***")
+    assert body["expires_in"] > 0
+    # Decrypt and verify it's a 6-digit code.
+    code = harness.decrypt_otp(body["ciphered_otp"])
+    assert len(code) == 6
+    assert code.isdigit()
+
+
+def test_otp_generate_enforces_cooldown(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    first = _otp_generate(harness, enrollment_id)
+    assert first.status_code == 200
+    # Immediate second call should be cooldown-refused.
+    second = _otp_generate(harness, enrollment_id)
+    assert second.status_code == 429
+    assert second.json()["type"] == "urn:face-verify:problem:otp-resend-cooldown"
+
+
+def test_otp_generate_rejected_after_otp_verified(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    _generate_and_verify_otp(harness, enrollment_id)
+    # The enrollment is now in awaiting_consent — generate should be refused.
+    gen = _otp_generate(harness, enrollment_id)
+    assert gen.status_code == 409
+
+
+# --- OTP verification ---------------------------------------------------------
+
+
+def test_otp_verify_accepts_sealed_code(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    gen = _otp_generate(harness, enrollment_id)
+    code = harness.decrypt_otp(gen.json()["ciphered_otp"])
+    sealed_code = harness.seal_otp(code)
+    verify = _otp_verify(harness, enrollment_id, sealed_code)
+    assert verify.status_code == 200
+    assert verify.json()["status"] == "awaiting_consent"
+
+
+def test_otp_verify_rejects_plaintext_code(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    _otp_generate(harness, enrollment_id)
+    # Send the code as plain text (not enc1: sealed) — must be refused.
+    resp = harness.client.post(
+        f"/api/v1/enrollments/{enrollment_id}/otp",
+        json={"otp_code_enc": "123456"},  # plain text, not sealed
+    )
+    assert resp.status_code == 422
+    assert resp.json()["type"] == "urn:face-verify:problem:invalid-otp-format"
+
+
+def test_otp_verify_rejects_wrong_code(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    _otp_generate(harness, enrollment_id)
+    # Seal a wrong code.
+    wrong_sealed = harness.seal_otp("000000")
+    resp = _otp_verify(harness, enrollment_id, wrong_sealed)
+    assert resp.status_code == 422
+    assert resp.json()["type"] == "urn:face-verify:problem:invalid-otp"
 
 
 def test_otp_must_verify_before_any_later_step(harness):
     enrollment_id = _enroll(harness).json()["enrollment_id"]
-    wrong = _otp(harness, enrollment_id, "000000")
-    assert wrong.status_code == 422
-    assert wrong.json()["type"] == "urn:face-verify:problem:invalid-otp"
-    # consent is refused while the OTP is unproven
+    _otp_generate(harness, enrollment_id)
+    # Consent is refused while the OTP is unproven.
     assert _consent(harness, enrollment_id).status_code == 409
-    right = _otp(harness, enrollment_id)
-    assert right.status_code == 200
-    assert right.json()["status"] == "awaiting_consent"
-    # single-use: the same code cannot verify twice
-    assert _otp(harness, enrollment_id).status_code == 409
+    # Face is refused while the OTP is unproven.
+    assert _face(harness, enrollment_id).status_code == 409
 
 
 def test_otp_attempts_are_capped_and_the_record_dies_exhausted(harness):
     enrollment_id = _enroll(harness).json()["enrollment_id"]
+    gen = _otp_generate(harness, enrollment_id)
+    real_code = harness.decrypt_otp(gen.json()["ciphered_otp"])
+    # Exhaust all 5 attempts with wrong codes.
     for _ in range(5):
-        assert _otp(harness, enrollment_id, "000000").status_code == 422
-    # attempts exhausted → the record was deleted; even the RIGHT code fails now
-    assert _otp(harness, enrollment_id, DEV_OTP).status_code == 422
+        wrong = harness.seal_otp("000000")
+        assert _otp_verify(harness, enrollment_id, wrong).status_code == 422
+    # Attempts exhausted → even the RIGHT code fails now.
+    right = harness.seal_otp(real_code)
+    assert _otp_verify(harness, enrollment_id, right).status_code == 422
 
 
-def test_immediate_resend_is_cooldown_refused(harness):
-    first = _enroll(harness)
-    again = _enroll(harness)
-    assert again.status_code == 429
-    assert again.json()["type"] == "urn:face-verify:problem:otp-resend-cooldown"
-    assert first.json()["enrollment_id"]
-
-
-def test_second_enroll_after_otp_returns_the_same_enrollment(harness):
-    first = _enroll(harness)
-    enrollment_id = first.json()["enrollment_id"]
-    assert _otp(harness, enrollment_id).status_code == 200
-    second = _enroll(harness)
-    assert second.status_code == 201
-    assert second.json()["enrollment_id"] == enrollment_id
-
-
-def test_face_before_the_stages_is_refused(harness):
+def test_otp_is_single_use(harness):
     enrollment_id = _enroll(harness).json()["enrollment_id"]
-    face = _face(harness, enrollment_id)
-    assert face.status_code == 409
-    assert face.json()["type"] == "urn:face-verify:problem:invalid-stage"
+    gen = _otp_generate(harness, enrollment_id)
+    code = harness.decrypt_otp(gen.json()["ciphered_otp"])
+    sealed = harness.seal_otp(code)
+    # First use succeeds.
+    assert _otp_verify(harness, enrollment_id, sealed).status_code == 200
+    # Second use of the same code is refused (stage has moved).
+    assert _otp_verify(harness, enrollment_id, sealed).status_code == 409
 
 
-# --- the full journey + the verdict --------------------------------------------
+# --- the full journey + the verdict ------------------------------------------
 
 
 def test_full_journey_register_otp_consent_face_status_verify(harness):
@@ -180,7 +274,7 @@ def test_lockout_after_three_failed_attempts(harness):
 
 def test_unsealed_embedding_is_refused(harness):
     enrollment_id = _enroll(harness).json()["enrollment_id"]
-    assert _otp(harness, enrollment_id).status_code == 200
+    _generate_and_verify_otp(harness, enrollment_id)
     assert _consent(harness, enrollment_id).status_code == 200
     face = harness.client.post(
         f"/api/v1/enrollments/{enrollment_id}/face",
@@ -203,7 +297,7 @@ def test_extra_image_like_fields_rejected_everywhere(harness):
     assert resp.status_code == 422
 
     enrollment_id = _enroll(harness).json()["enrollment_id"]
-    assert _otp(harness, enrollment_id).status_code == 200
+    _generate_and_verify_otp(harness, enrollment_id)
     assert _consent(harness, enrollment_id).status_code == 200
     face = harness.client.post(
         f"/api/v1/enrollments/{enrollment_id}/face",
@@ -214,7 +308,7 @@ def test_extra_image_like_fields_rejected_everywhere(harness):
 
 def test_sealed_image_like_payload_is_refused(harness):
     enrollment_id = _enroll(harness).json()["enrollment_id"]
-    assert _otp(harness, enrollment_id).status_code == 200
+    _generate_and_verify_otp(harness, enrollment_id)
     assert _consent(harness, enrollment_id).status_code == 200
     face = harness.client.post(
         f"/api/v1/enrollments/{enrollment_id}/face",
@@ -253,3 +347,21 @@ def test_embedding_never_returned_and_audit_has_outcomes_only(harness):
     blob = json.dumps(audit.json())
     assert "embedding" not in blob
     assert "0.1" not in blob
+
+
+# --- OTP export encryption tests (aes256gcm) ----------------------------------
+
+
+def test_ciphered_otp_never_in_enrollment_response(harness):
+    """POST /enrollments must NOT return any OTP material."""
+    resp = _enroll(harness)
+    body = resp.json()
+    assert "ciphered_otp" not in body
+    assert "otp_code" not in body
+
+
+def test_face_before_the_stages_is_refused(harness):
+    enrollment_id = _enroll(harness).json()["enrollment_id"]
+    face = _face(harness, enrollment_id)
+    assert face.status_code == 409
+    assert face.json()["type"] == "urn:face-verify:problem:invalid-stage"

@@ -8,6 +8,11 @@
 - unknown username is indistinguishable from a mismatch (anti-enumeration);
 - verification attempts are capped (5 per 10 min) then a designed 429 lockout;
 - every attempt is audited (outcomes only).
+
+OTP dispatch architecture (2026-09-02): fverify OWNS the OTP (mint + verify).
+The plaintext code is exported via AES-256-GCM to Agentys, which dispatches
+via WhatsApp in an ephemeral Code Execution Node. The user's typed OTP is
+sealed (enc1:) by the mobile app so Agentys never sees it.
 """
 
 import base64
@@ -22,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import crypto, match, otp, seal, sms
+from . import crypto, match, otp, otp_export, seal
 from .config import Settings, get_settings
 from .errors import ProblemError, invalid_embedding
 from .models import AuditEvent, Enrollment, OtpRecord, utcnow
@@ -35,6 +40,10 @@ MAX_EMBEDDING_DIM = 4096
 _IMAGE_LIKE_MARKERS = ("image", "selfie", "photo", "picture", "frame", "snapshot")
 
 
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+
 class EnrollRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -46,14 +55,27 @@ class EnrollRequest(BaseModel):
 class EnrollResponse(BaseModel):
     enrollment_id: str
     status: str
-    #: the masked REGISTERED mobile the OTP went to (never the full number)
+    #: the masked REGISTERED mobile (never the full number)
     mobile_hint: str
+
+
+class OtpGenerateResponse(BaseModel):
+    enrollment_id: str
+    #: AES-256-GCM encrypted OTP (for the Agentys Code Execution Node)
+    ciphered_otp: str
+    #: full mobile number (for the WhatsApp API payload in the Code Node)
+    mobile: str
+    #: masked mobile (for UI display)
+    mobile_hint: str
+    #: seconds until the code expires
+    expires_in: int
 
 
 class OtpVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    otp_code: str = Field(min_length=4, max_length=8)
+    #: the user-typed OTP, sealed in an enc1: envelope by the mobile app
+    otp_code_enc: str = Field(min_length=1)
 
 
 class ConsentRequest(BaseModel):
@@ -95,6 +117,16 @@ class VerifyResponse(BaseModel):
     verdict: str
     score: float
     threshold: float
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def mask_mobile(mobile: str) -> str:
+    """Mask a mobile number, showing only the last 3 digits."""
+    digits = "".join(ch for ch in mobile if ch.isdigit())
+    return f"*** *** {digits[-3:]}" if len(digits) >= 3 else "***"
 
 
 async def get_session(request: Request):
@@ -176,6 +208,23 @@ def _unseal_embedding(embedding_enc: str, request: Request) -> list[float]:
     return [float(x) for x in payload]
 
 
+def _unseal_otp_code(otp_code_enc: str, request: Request) -> str:
+    """Unseal an `enc1:` envelope containing the user-typed OTP code.
+
+    The mobile app seals the code with fverify's RSA public key so that
+    Agentys (the orchestrator) never sees the plaintext in its LangGraph state.
+    """
+    try:
+        plaintext = seal.unseal_envelope(otp_code_enc, request.app.state.seal_private_key)
+    except seal.SealError as exc:
+        raise ProblemError(
+            422, "invalid-otp-format",
+            "OTP must be sealed",
+            f"The OTP code must be sent in an enc1: envelope: {exc}",
+        ) from exc
+    return plaintext.decode("utf-8").strip()
+
+
 async def _audit(
     session: AsyncSession,
     username: str,
@@ -195,37 +244,30 @@ async def _audit(
     )
 
 
+# ---------------------------------------------------------------------------
+# Enrollment — pure identity registration
+# ---------------------------------------------------------------------------
+
 @router.post("/enrollments", status_code=201, response_model=EnrollResponse)
-async def create_enrollment(body: EnrollRequest, session: SessionDep, request: Request):
+async def create_enrollment(body: EnrollRequest, session: SessionDep):
     """PURE IDENTITY registration (owner ruling 2026-08-31): this blackbox
     knows ONLY user identity — username, credential, face, OTP. No customer
     ids, no core banking, no T24 anywhere: the username ↔ customer_id linkage
-    lives in the mobile DB and is written through Agentys, never here."""
+    lives in the mobile DB and is written through Agentys, never here.
+
+    OTP dispatch refactor (2026-09-02): this endpoint now ONLY creates the
+    identity record. OTP generation is handled by the dedicated
+    POST /enrollments/{id}/otp/generate endpoint.
+    """
     existing = await session.scalar(
         select(Enrollment).where(Enrollment.username == body.username)
     )
     if existing is not None:
-        # Idempotent — but a resend while awaiting the OTP respects the cooldown.
-        if existing.status == "awaiting_otp":
-            record = await session.get(OtpRecord, existing.id)
-            remaining = otp.resend_cooldown_remaining(record)
-            if remaining > 0:
-                raise ProblemError(
-                    429,
-                    "otp-resend-cooldown",
-                    "A code was just sent",
-                    f"Please wait {remaining}s before requesting a new one.",
-                )
-            code = await otp.mint_and_store(session, existing.id)
-            hint = await sms.send_otp_sms(existing.mobile, code)
-            await session.commit()
-            return EnrollResponse(
-                enrollment_id=existing.id, status=existing.status, mobile_hint=hint
-            )
+        # Idempotent — return the existing enrollment.
         return EnrollResponse(
             enrollment_id=existing.id,
             status=existing.status,
-            mobile_hint=sms.mask_mobile(existing.mobile),
+            mobile_hint=mask_mobile(existing.mobile),
         )
 
     enrollment = Enrollment(
@@ -236,8 +278,6 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
     )
     session.add(enrollment)
     await session.flush()
-    code = await otp.mint_and_store(session, enrollment.id)
-    hint = await sms.send_otp_sms(enrollment.mobile, code)
     await _audit(
         session,
         username=body.username,
@@ -247,14 +287,75 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
     )
     await session.commit()
     return EnrollResponse(
-        enrollment_id=enrollment.id, status=enrollment.status, mobile_hint=hint
+        enrollment_id=enrollment.id,
+        status=enrollment.status,
+        mobile_hint=mask_mobile(enrollment.mobile),
+    )
+
+
+# ---------------------------------------------------------------------------
+# OTP — generate (for Agentys) and verify (from the mobile app)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/enrollments/{enrollment_id}/otp/generate",
+    response_model=OtpGenerateResponse,
+)
+async def generate_otp(enrollment_id: str, session: SessionDep):
+    """Mint a cryptographically random 6-digit OTP, store its salted hash,
+    and return the code encrypted with AES-256-GCM for the Agentys Code
+    Execution Node.
+
+    The Agentys node decrypts the code in ephemeral RAM, fires the WhatsApp
+    dispatch, and returns only ``{"status": "dispatched"}`` to the graph state.
+    The plaintext code is destroyed when the Python function exits.
+    """
+    enrollment = await session.get(Enrollment, enrollment_id)
+    if enrollment is None:
+        raise ProblemError(
+            404, "enrollment-not-found", "Enrollment not found", "No such enrollment."
+        )
+    if enrollment.status != "awaiting_otp":
+        raise ProblemError(
+            409, "invalid-stage", "This step is not available now",
+            "OTP generation is only available during the awaiting_otp stage.",
+        )
+
+    # Enforce resend cooldown.
+    record = await session.get(OtpRecord, enrollment.id)
+    remaining = otp.resend_cooldown_remaining(record)
+    if remaining > 0:
+        raise ProblemError(
+            429, "otp-resend-cooldown", "A code was just sent",
+            f"Please wait {remaining}s before requesting a new one.",
+        )
+
+    settings = get_settings()
+    code = await otp.mint_and_store(session, enrollment.id)
+    ciphered = otp_export.encrypt_otp_for_export(code, settings.otp_export_key)
+    # The plaintext `code` is now only in `ciphered`; Python will GC the local.
+
+    await session.commit()
+    return OtpGenerateResponse(
+        enrollment_id=enrollment.id,
+        ciphered_otp=ciphered,
+        mobile=enrollment.mobile,
+        mobile_hint=mask_mobile(enrollment.mobile),
+        expires_in=settings.otp_ttl_seconds,
     )
 
 
 @router.post("/enrollments/{enrollment_id}/otp", response_model=StageResponse)
 async def verify_enrollment_otp(
-    enrollment_id: str, body: OtpVerifyRequest, session: SessionDep
+    enrollment_id: str, body: OtpVerifyRequest, session: SessionDep, request: Request,
 ):
+    """Verify the user-typed OTP code.
+
+    OTP dispatch refactor (2026-09-02): the code arrives sealed in an ``enc1:``
+    envelope (RSA-OAEP-SHA-256) — the mobile app encrypts the user's input with
+    fverify's public key so that Agentys never sees the plaintext in its
+    LangGraph Postgres state.
+    """
     enrollment = await session.get(Enrollment, enrollment_id)
     if enrollment is None:
         raise ProblemError(
@@ -264,7 +365,11 @@ async def verify_enrollment_otp(
         raise ProblemError(
             409, "invalid-stage", "This step is not available now", "Continue in the app."
         )
-    if not await otp.verify(session, enrollment.id, body.otp_code):
+
+    # Unseal the enc1: envelope to get the plaintext OTP code.
+    code = _unseal_otp_code(body.otp_code_enc, request)
+
+    if not await otp.verify(session, enrollment.id, code):
         await _audit(
             session, enrollment.username, enrollment_id=enrollment.id,
             event="otp", outcome="rejected",
@@ -284,6 +389,10 @@ async def verify_enrollment_otp(
     await session.commit()
     return StageResponse(status=enrollment.status)
 
+
+# ---------------------------------------------------------------------------
+# Consent + Face submission
+# ---------------------------------------------------------------------------
 
 @router.post("/enrollments/{enrollment_id}/consent", response_model=StageResponse)
 async def record_consent(enrollment_id: str, body: ConsentRequest, session: SessionDep):
@@ -350,6 +459,10 @@ async def submit_face(
     await session.commit()
     return FaceSubmitResponse(status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat())
 
+
+# ---------------------------------------------------------------------------
+# Status + Verification
+# ---------------------------------------------------------------------------
 
 @router.get("/enrollments/by-username/{username}/status", response_model=StatusResponse)
 async def enrollment_status(username: str, session: SessionDep):

@@ -91,6 +91,12 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     #: salt for one-time-secret hashing (env-overridden per environment)
     otp_hash_salt: str = "fv-dev-only-salt"
 
+    # AES-256-GCM key for encrypting OTPs exported to Agentys.
+    # Must be a 32-byte key, base64-encoded. Generate with:
+    #   python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+    # DEV-ONLY default — any real deployment MUST set FV_OTP_EXPORT_KEY.
+    otp_export_key: str = "dGhpcy1pcy1hLWRldi1vbmx5LWtleS0zMmJ5dGVzISE="
+
 
 @lru_cache
 def get_settings() -> Settings:
