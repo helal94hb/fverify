@@ -10,7 +10,11 @@ import TestRenderer, { act } from 'react-test-renderer';
 import App, { initialFlowState, reduceFlow, type FlowState } from '../src/App';
 import type { IdentityInfo } from '../src/screens/IdentityScreen';
 
-const identity: IdentityInfo = { nationalId: 'TEST-ID-0001' };
+const identity: IdentityInfo = {
+  username: 'face.user',
+  password: 'Sup3r#Secret1',
+  mobile: '01000000000',
+};
 const ENROLLMENT = { enrollmentId: 'enr-1', mobileHint: '*** *** 000' };
 
 /** Walk the machine to the document step via every legitimate gate. */
@@ -110,13 +114,19 @@ describe('App — the staged gates in the rendered tree', () => {
       status: 'awaiting_otp',
       mobile_hint: '*** *** 000',
     })),
+    generateOtp: jest.fn(async () => ({
+      enrollment_id: 'enr-1',
+      ciphered_otp: 'aes256gcm:TESTCIPHER',
+      mobile: '01000000000',
+      mobile_hint: '*** *** 000',
+      expires_in: 600,
+    })),
     verifyEnrollmentOtp: jest.fn(async () => ({ status: 'awaiting_consent' })),
     recordConsent: jest.fn(async () => ({ status: 'awaiting_face' })),
     submitEnrollmentFace: jest.fn(async () => ({ status: 'enrolled' })),
-    getEnrollmentStatusByNationalId: jest.fn(async () => ({
+    getEnrollmentStatusByUsername: jest.fn(async () => ({
       enrolled: false,
       enrolled_at: null,
-      customer_id: null,
       status: null,
     })),
     verifyFace: jest.fn(async () => ({ verdict: 'verified' as const, score: 0.9, threshold: 0.8 })),
@@ -133,7 +143,9 @@ describe('App — the staged gates in the rendered tree', () => {
     expect(root.findAllByProps({ testID: 'otp-screen' })).toHaveLength(0);
 
     act(() => {
-      root.findByProps({ testID: 'national-id-input' }).props.onChangeText('TEST-ID-0001');
+      root.findByProps({ testID: 'username-input' }).props.onChangeText('face.user');
+      root.findByProps({ testID: 'password-input' }).props.onChangeText('Sup3r#Secret1');
+      root.findByProps({ testID: 'mobile-input' }).props.onChangeText('01000000000');
     });
     await act(async () => {
       root.findByProps({ testID: 'identity-submit-button' }).props.onPress();

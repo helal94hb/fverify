@@ -34,11 +34,11 @@ Orchestrates a first-time face enrollment for a customer of the Bank.
 
 **Stage 2 — register the identity (fverify):**
 `POST /api/v1/enrollments` `{username, password, mobile}` → `{enrollment_id, status:"awaiting_otp", mobile_hint}`.
-fverify mints the OTP and dispatches it (its SMS seam; today dev stub code `123456` — see §4).
+This call mints NO code. The code is minted by `POST /api/v1/enrollments/{id}/otp/generate` → `{ciphered_otp, mobile, mobile_hint, expires_in}` — `ciphered_otp` is AES-256-GCM under the shared export key (`FV_OTP_EXPORT_KEY` in the secrets registry). Your Code Execution Node decrypts it in RAM, dispatches via WhatsApp, and returns only a status to the run state — the plaintext code never lands in run state (see §4).
 
-**Stage 3 — OTP proof (fverify):** the channel collects the code →
-`POST /api/v1/enrollments/{id}/otp` `{otp_code}` → `{status:"awaiting_consent"}`.
-422 `invalid-otp` → the designed retry state (single-use, 5 attempts, resend cooldown 429).
+**Stage 3 — OTP proof (fverify):** the channel collects the code and SEALS it (`enc1:`, fverify's public key — the typed code never crosses you cleartext) →
+`POST /api/v1/enrollments/{id}/otp` `{otp_code_enc}` → `{status:"awaiting_consent"}`.
+422 `invalid-otp-format` if unsealed; 422 `invalid-otp` → the designed retry state (single-use, 5 attempts, resend cooldown 429 on a fresh generate).
 
 **Stage 4 — consent (fverify):** the channel shows the consent copy (versioned) →
 `POST /api/v1/enrollments/{id}/consent` `{consent_version}` → `{status:"awaiting_face"}`.

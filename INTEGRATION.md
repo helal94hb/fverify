@@ -18,20 +18,37 @@ All routes are under `/api/v1`. Errors are RFC 7807 `application/problem+json`
 
 ## Registration (staged: identity → OTP → consent → face)
 
-### POST /api/v1/enrollments — register + send the OTP
+### POST /api/v1/enrollments — register the identity (record only)
 ```json
 REQ  {"username": "face.user", "password": "••••••••", "mobile": "01000000000"}
 RESP 201 {"enrollment_id": "<id>", "status": "awaiting_otp", "mobile_hint": "*** *** 000"}
 ```
-Idempotent per username; resend while awaiting the OTP respects the cooldown
-(429 `otp-resend-cooldown`).
+Idempotent per username. **This call mints NO code** — OTP generation is the
+dedicated generate endpoint below (OTP dispatch refactor, 2026-09-02).
+
+### POST /api/v1/enrollments/{enrollment_id}/otp/generate — mint + export the OTP
+```json
+RESP 200 {"enrollment_id": "<id>", "ciphered_otp": "aes256gcm:<nonce|ct|tag>",
+          "mobile": "01000000000", "mobile_hint": "*** *** 000", "expires_in": 600}
+```
+The 3-layer dispatch architecture: fverify OWNS the OTP (mint + verify);
+`ciphered_otp` is the plaintext code AES-256-GCM-encrypted under the shared
+export key (`FV_OTP_EXPORT_KEY` — fverify holds it, the Agentys secrets
+registry holds it). The Agentys Code Execution Node decrypts it in RAM, fires
+the WhatsApp dispatch to `mobile`, and returns only a status to the run state —
+the plaintext code never lands in Agentys' Postgres. Resend within the cooldown
+window → 429 `otp-resend-cooldown`. 409 `invalid-stage` once past
+`awaiting_otp`.
 
 ### POST /api/v1/enrollments/{enrollment_id}/otp — prove the code
 ```json
-REQ  {"otp_code": "123456"}
+REQ  {"otp_code_enc": "enc1:<the typed 6-digit code, RSA-OAEP-sealed, kid fv-dev1>"}
 RESP 200 {"status": "awaiting_consent"}
 ```
-422 `invalid-otp` (single-use, TTL'd, 5 attempts). 409 `invalid-stage` out of order.
+The typed code ALWAYS crosses sealed — the app seals it with fverify's public
+key so the orchestrator never carries it cleartext. An unsealed payload is a
+designed 422 `invalid-otp-format`; a wrong/expired code is 422 `invalid-otp`
+(single-use, TTL'd, 5 attempts). 409 `invalid-stage` out of order.
 
 ### POST /api/v1/enrollments/{enrollment_id}/consent
 ```json

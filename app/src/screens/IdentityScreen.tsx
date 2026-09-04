@@ -1,14 +1,18 @@
 /**
- * Identity — the national ID only (owner ruling 2026-08-31: the anchor is
- * T24; the core resolves the customer id + the REGISTERED mobile, so the
- * customer never types a phone number here — and nobody can self-assert one).
+ * Identity — the self-asserted credentials (owner ruling 2026-08-31: PURE
+ * IDENTITY — this blackbox knows username, credential, face, OTP only; the
+ * username ↔ customer_id linkage lives in the mobile DB via Agentys, never
+ * here — and the 2026-09-02 OTP dispatch refactor: this enrollment only
+ * creates the record, the code is minted by the generate call that follows).
  */
 
 import React, { useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 export interface IdentityInfo {
-  nationalId: string;
+  username: string;
+  password: string;
+  mobile: string;
 }
 
 export interface IdentityScreenProps {
@@ -16,28 +20,60 @@ export interface IdentityScreenProps {
 }
 
 export function IdentityScreen({ onSubmit }: IdentityScreenProps): React.JSX.Element {
-  const [nationalId, setNationalId] = useState('');
-  const ready = nationalId.trim().length >= 8;
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [mobile, setMobile] = useState('');
+  // mirror the backend's field minimums (EnrollRequest: 3 / 8 / 5)
+  const ready =
+    username.trim().length >= 3 && password.length >= 8 && mobile.trim().length >= 5;
 
   return (
     <View style={styles.container} testID="identity-screen">
       <Text style={styles.title}>Confirm your identity</Text>
-      <Text style={styles.label}>National ID</Text>
+      <Text style={styles.label}>Username</Text>
       <TextInput
         style={styles.input}
-        testID="national-id-input"
-        value={nationalId}
-        onChangeText={setNationalId}
+        testID="username-input"
+        value={username}
+        onChangeText={setUsername}
         autoCapitalize="none"
         autoCorrect={false}
         keyboardType="visible-password"
-        placeholder="National ID number"
+        placeholder="Username"
+      />
+      <Text style={styles.label}>Password</Text>
+      <TextInput
+        style={styles.input}
+        testID="password-input"
+        value={password}
+        onChangeText={setPassword}
+        autoCapitalize="none"
+        autoCorrect={false}
+        secureTextEntry
+        placeholder="Password"
+      />
+      <Text style={styles.label}>Mobile</Text>
+      <TextInput
+        style={styles.input}
+        testID="mobile-input"
+        value={mobile}
+        onChangeText={setMobile}
+        autoCapitalize="none"
+        autoCorrect={false}
+        keyboardType="phone-pad"
+        placeholder="Registered mobile number"
       />
       <Pressable
         style={[styles.primaryButton, !ready && styles.disabled]}
         testID="identity-submit-button"
         disabled={!ready}
-        onPress={() => onSubmit({ nationalId: nationalId.trim() })}
+        onPress={() =>
+          onSubmit({
+            username: username.trim(),
+            password,
+            mobile: mobile.trim(),
+          })
+        }
       >
         <Text style={styles.primaryButtonText}>Continue</Text>
       </Pressable>

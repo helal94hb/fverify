@@ -5,8 +5,10 @@
  * identity → otp → consent → document → liveness → processing → verdict
  *
  * STAGE GATES (structural, tested):
- *  - the OTP step exists only after an enrollment id exists (the backend sent
- *    a code to the T24-registered mobile — no anchor, no code);
+ *  - the OTP step exists only after an enrollment id exists and a code was
+ *    minted (the 2026-09-02 dispatch refactor: enrollment creates the record,
+ *    the generate call mints — dev lane stands in for the Agentys dispatch
+ *    node, and the app never opens the ciphered export);
  *  - camera-bearing steps ('document', 'liveness') exist only in states
  *    carrying a consentVersion, and only CONSENT_RECORDED can introduce one —
  *    no consent, no camera, by construction.
@@ -192,13 +194,13 @@ async function runProcessingPipeline(
   client: FaceVerifyClient,
   extractor: EmbeddingExtractor,
   enrollmentId: string,
-  nationalId: string,
+  username: string,
 ): Promise<Verdict> {
   const embedding = await extractor.extractEmbedding(getLatestFaceCrop() ?? 'skeleton-frame');
   const embeddingEnc = seal(encodeEmbeddingForWire(embedding));
   const face = await client.submitEnrollmentFace(enrollmentId, embeddingEnc);
   if (face.status !== 'enrolled') throw new Error(`face upload refused: ${face.status}`);
-  const { verdict } = await client.verifyFace(nationalId, embeddingEnc);
+  const { verdict } = await client.verifyFace(username, embeddingEnc);
   return verdict;
 }
 
@@ -213,18 +215,28 @@ export default function App({ client, extractor }: AppProps): React.JSX.Element 
   const [state, dispatch] = useReducer(reduceFlow, initialFlowState);
   const api = client ?? createFaceVerifyClient();
 
-  // enrollment request fires on entering otp-request
+  // enrollment + first code mint fire on entering otp-request
   useEffect(() => {
     if (state.step !== 'otp-request') return;
     let cancelled = false;
     api
-      .createEnrollment({ nationalId: state.identity.nationalId })
-      .then((res) => {
+      .createEnrollment({
+        username: state.identity.username,
+        password: state.identity.password,
+        mobile: state.identity.mobile,
+      })
+      .then((res) =>
+        // the 2026-09-02 dispatch refactor: enrollment only CREATES the record;
+        // the generate call mints the code (dev lane: stands in for the Agentys
+        // dispatch node — the app never opens the ciphered export)
+        api.generateOtp(res.enrollment_id),
+      )
+      .then((gen) => {
         if (!cancelled) {
           dispatch({
             type: 'ENROLLMENT_CREATED',
-            enrollmentId: res.enrollment_id,
-            mobileHint: res.mobile_hint,
+            enrollmentId: gen.enrollment_id,
+            mobileHint: gen.mobile_hint,
           });
         }
       })
@@ -242,7 +254,7 @@ export default function App({ client, extractor }: AppProps): React.JSX.Element 
     let cancelled = false;
     (extractor ? Promise.resolve(extractor) : resolveDefaultExtractor())
       .then((resolved) =>
-        runProcessingPipeline(api, resolved, state.enrollmentId, state.identity.nationalId),
+        runProcessingPipeline(api, resolved, state.enrollmentId, state.identity.username),
       )
       .then((verdict) => {
         if (!cancelled) dispatch({ type: 'VERDICT_RECEIVED', verdict });
@@ -271,7 +283,8 @@ export default function App({ client, extractor }: AppProps): React.JSX.Element 
             dispatch({ type: 'OTP_VERIFIED' });
           }}
           onResend={async () => {
-            await api.createEnrollment({ nationalId: state.identity.nationalId });
+            // resend = a fresh generate (the server's cooldown is the gate)
+            await api.generateOtp(state.enrollmentId);
           }}
         />
       )}

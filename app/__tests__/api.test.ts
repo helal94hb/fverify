@@ -31,22 +31,63 @@ function lastCall(): { url: string; init: RequestInit } {
   return { url, init: init ?? {} };
 }
 
+const ENROLL_REQ = { username: 'face.user', password: 'Sup3r#Secret1', mobile: '01000000000' };
+
 describe('FaceVerifyClient — call shapes', () => {
   const client = createFaceVerifyClient();
 
-  it('POST /api/v1/enrollments sends identity + consent version (snake_case)', async () => {
+  it('POST /api/v1/enrollments sends the pure-identity record (snake_case)', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(201, { enrollment_id: 'enr-1', status: 'awaiting_otp', mobile_hint: '*** *** 000' }),
     );
 
-    const res = await client.createEnrollment({ nationalId: 'TEST-ID-0001' });
+    const res = await client.createEnrollment(ENROLL_REQ);
 
     expect(res).toEqual({ enrollment_id: 'enr-1', status: 'awaiting_otp', mobile_hint: '*** *** 000' });
     const { url, init } = lastCall();
     expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments`);
     expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({ national_id: 'TEST-ID-0001' });
+    expect(JSON.parse(String(init.body))).toEqual({
+      username: 'face.user',
+      password: 'Sup3r#Secret1',
+      mobile: '01000000000',
+    });
     expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+  });
+
+  it('POST /api/v1/enrollments/{id}/otp/generate mints the code (dispatch export)', async () => {
+    const payload = {
+      enrollment_id: 'enr-1',
+      ciphered_otp: 'aes256gcm:TESTCIPHER',
+      mobile: '01000000000',
+      mobile_hint: '*** *** 000',
+      expires_in: 600,
+    };
+    fetchMock.mockResolvedValue(jsonResponse(200, payload));
+
+    const res = await client.generateOtp('enr-1');
+
+    expect(res).toEqual(payload);
+    const { url, init } = lastCall();
+    expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments/enr-1/otp/generate`);
+    expect(init.method).toBe('POST');
+    expect(init.body).toBeUndefined();
+  });
+
+  it('POST /api/v1/enrollments/{id}/otp sends the typed code SEALED (enc1:)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { status: 'awaiting_consent' }));
+
+    const res = await client.verifyEnrollmentOtp('enr-1', '123456');
+
+    expect(res.status).toBe('awaiting_consent');
+    const { url, init } = lastCall();
+    expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments/enr-1/otp`);
+    expect(init.method).toBe('POST');
+    const body = JSON.parse(String(init.body));
+    // the plaintext code must never appear — only the sealed envelope
+    expect(Object.keys(body)).toEqual(['otp_code_enc']);
+    expect(body.otp_code_enc).toMatch(/^enc1:/);
+    expect(body.otp_code_enc).not.toContain('123456');
   });
 
   it('POST /api/v1/enrollments/{id}/face sends only the sealed embedding', async () => {
@@ -63,14 +104,14 @@ describe('FaceVerifyClient — call shapes', () => {
     expect(body.embedding_enc).toBe('enc1:TESTSEALED');
   });
 
-  it('GET /api/v1/enrollments/by-national-id/{id}/status sends no body', async () => {
+  it('GET /api/v1/enrollments/by-username/{username}/status sends no body', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { enrolled: true, enrolled_at: '2026-08-29T00:00:00Z' }));
 
-    const res = await client.getEnrollmentStatusByNationalId('TEST-ID-0001');
+    const res = await client.getEnrollmentStatusByUsername('face.user');
 
     expect(isEnrolled(res)).toBe(true);
     const { url, init } = lastCall();
-    expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments/by-national-id/TEST-ID-0001/status`);
+    expect(url).toBe(`${API_BASE_URL}/api/v1/enrollments/by-username/face.user/status`);
     expect(init.method).toBe('GET');
     expect(init.body).toBeUndefined();
   });
@@ -79,23 +120,23 @@ describe('FaceVerifyClient — call shapes', () => {
     const verdictPayload: VerifyResponse = { verdict: 'verified', score: 0.91, threshold: 0.6 };
     fetchMock.mockResolvedValue(jsonResponse(200, verdictPayload));
 
-    const res = await client.verifyFace('TEST-ID-0001', 'enc1:TESTSEALED');
+    const res = await client.verifyFace('face.user', 'enc1:TESTSEALED');
 
     expect(res).toEqual(verdictPayload);
     const { url, init } = lastCall();
     expect(url).toBe(`${API_BASE_URL}/api/v1/verifications`);
     expect(init.method).toBe('POST');
     expect(JSON.parse(String(init.body))).toEqual({
-      national_id: 'TEST-ID-0001',
+      username: 'face.user',
       embedding_enc: 'enc1:TESTSEALED',
     });
   });
 
   it('isEnrolled reads the backend shape ({enrolled}) and fails closed otherwise', () => {
     expect(
-      isEnrolled({ enrolled: true, enrolled_at: '2026-08-29T00:00:00Z', customer_id: 'c1', status: 'enrolled' }),
+      isEnrolled({ enrolled: true, enrolled_at: '2026-08-29T00:00:00Z', status: 'enrolled' }),
     ).toBe(true);
-    expect(isEnrolled({ enrolled: false, enrolled_at: null, customer_id: null, status: null })).toBe(false);
+    expect(isEnrolled({ enrolled: false, enrolled_at: null, status: null })).toBe(false);
   });
 });
 
@@ -106,7 +147,7 @@ describe('FaceVerifyClient — fail-closed error paths', () => {
     fetchMock.mockResolvedValue(
       jsonResponse(429, { title: 'Too Many Requests', status: 429 }),
     );
-    const err = await client.verifyFace('TEST-ID-0001', 'enc1:X').catch((e) => e);
+    const err = await client.verifyFace('face.user', 'enc1:X').catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).reason).toBe('http');
     expect((err as ApiError).status).toBe(429);
@@ -115,7 +156,7 @@ describe('FaceVerifyClient — fail-closed error paths', () => {
 
   it('throws ApiError when the network is unreachable', async () => {
     fetchMock.mockRejectedValue(new Error('boom'));
-    const err = await client.getEnrollmentStatusByNationalId('TEST-ID-0001').catch((e) => e);
+    const err = await client.getEnrollmentStatusByUsername('face.user').catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).reason).toBe('network');
     expect((err as ApiError).status).toBe(0);
@@ -125,7 +166,7 @@ describe('FaceVerifyClient — fail-closed error paths', () => {
     fetchMock.mockResolvedValue(
       new Response('not-json', { status: 200, headers: { 'Content-Type': 'text/plain' } }),
     );
-    const err = await client.verifyFace('TEST-ID-0001', 'enc1:X').catch((e) => e);
+    const err = await client.verifyFace('face.user', 'enc1:X').catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).reason).toBe('bad-response');
   });
