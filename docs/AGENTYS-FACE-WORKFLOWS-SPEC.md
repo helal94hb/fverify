@@ -78,19 +78,25 @@ Proves a person is physically present and matches an enrolled identity — usabl
 
 The capture UI belongs to the channel (banking mobile app) and is driven by YOUR stage outputs. Tested reference code is parked at `face-verify/app/PARKED.md` (consent / identity / OTP / document / liveness / verdict screens, the randomized liveness engine, the on-device embedding extractor with MobileFaceNet `mobilefacenet.tflite`, and the JS `enc1:` seal). It is reference code, not a shipped app — lift what you need; the flow state comes from the workflow, not from the app.
 
-## 4. The OTP dispatch seam (integration point, open item)
+## 4. The OTP dispatch seam (LANDED, 2026-09-02)
 
-fverify mints and verifies the OTP itself (owner ruling). DELIVERY rides its SMS seam (`send_otp_sms`) — today a dev stub (fixed code `123456`, nothing sent). Two ways to make it real, the team's choice:
+fverify mints and verifies every OTP itself (owner ruling — the banking BFF
+knows NOTHING about OTPs). Delivery rides the 3-layer dispatch architecture the
+team shipped: `POST /api/v1/enrollments/{id}/otp/generate` returns
+`ciphered_otp` — the plaintext code AES-256-GCM-encrypted under the shared
+export key (`FV_OTP_EXPORT_KEY` / `OTP_DECRYPT_KEY` in the Agentys secrets
+registry). Your Code Execution Node decrypts it in RAM, fires the WhatsApp
+dispatch, and returns only `{"status": "dispatched"}` to the run state. The
+plaintext code never lands in Agentys' Postgres; the typed code crosses back
+sealed (`enc1:`, fv-dev1) and fverify alone opens it.
 
-- **Provider direct** (Twilio/Egyptian gateway) inside fverify's seam, or
-- **Your SMS workflow** — fverify's seam calls your SMS-dispatch agent (the same one the banking OTP spec names), making Agentys the SMS path for both.
-
-Until one lands, the dev code keeps lanes and demos working.
+The same two endpoints (generate + verify) are the target for the banking
+SIGN-UP OTP too — see `AGENTYS-ONBOARDING-OTP-MIGRATION.md`.
 
 ## 5. Errors you must map (never invent new shapes)
 
 From `INTEGRATION.md` — map each to its designed channel state:
-`not-a-customer` (404) · `otp-resend-cooldown` (429) · `invalid-otp` (422) · `invalid-stage` (409) · `invalid-embedding` (422) · `verification-locked` (429) · RFC 7807 envelope throughout.
+`otp-resend-cooldown` (429) · `invalid-otp` (422) · `invalid-otp-format` (422) · `invalid-stage` (409) · `invalid-embedding` (422) · `verification-locked` (429) · RFC 7807 envelope throughout.
 
 ## 6. Hard rules checklist (the validator will test these)
 
