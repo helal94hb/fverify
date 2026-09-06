@@ -56,20 +56,24 @@ enrolment — D-DB-8). From this moment, sign-in by username resolves the custom
 
 **Terminal state:** `completed`, outputs `{enrolled: true, username, customer_id, enrolled_at}`.
 
-## 1a. Onboarding-embedded face enrollment (the app-side contract, shipped 2026-09-05)
+## 1a. Onboarding-embedded face enrollment (the app-side contract, shipped 2026-09-05; CORRECTED 2026-09-06)
 
-The banking mobile app's onboarding wizard now renders the face frames NATIVELY when the graph asks — the app still never calls fverify; the graph's nodes do (server-to-server). Two new `ui_schema.view` values the graph may emit from the onboarding flow (post-credentials, skippable in v1):
+The banking mobile app's onboarding wizard renders the face frames NATIVELY when the graph asks — the app still never calls fverify; the graph's nodes do (server-to-server).
 
-| view | the app renders | the app resumes the run with |
+**CORRECTION (from the engine source read, day-61 snapshot): a node CANNOT emit a custom `ui_schema.view` — the engine derives views from a closed enum (form/success/error/processing/approval).** The contract is therefore the AWAITED FIELD KEY, not a view name. The face steps are human-input nodes awaiting these keys (the app maps them to its native frames):
+
+| the graph pauses awaiting | the app renders | the app resumes the run with |
 |---|---|---|
-| `face_consent` | the consent screen (versioned copy, camera has not opened yet) | `{ "consent_version": "1.0" }` — a node then records it at fverify `POST /enrollments/{id}/consent` |
-| `face_capture` | the liveness challenge (randomized blink/turn), then on-device extraction | `{ "embedding_enc": "enc1:<compact 128-dim, fv-dev1>" }` — a node then submits it to fverify `POST /enrollments/{id}/face` |
+| `consent_version` | the consent screen (versioned copy, camera has not opened yet) | `{ "consent_version": "1.0" }` — a node then records it at fverify `POST /enrollments/{id}/consent` |
+| `embedding_enc` | the liveness challenge (randomized blink/turn), then on-device extraction | `{ "embedding_enc": "enc1:<compact 128-dim, fv-dev1>" }` — a node then submits it to fverify `POST /enrollments/{id}/face` |
+
+(The app and the BFF adapter ALSO accept the literal views `face_consent` / `face_capture` as a secondary mapping — harmless forward-compat if the engine ever learns custom views. The field keys are what works today.)
 
 **Skip path (must exist):** the consent screen and the retry verdict both offer "Skip for now" → the app resumes `{ "face_skipped": "true" }` and the graph MUST treat that as a designed completion of the face block (v1 is Android-first; iOS capture is pending the Pods conflict). A run that cannot skip is a defect — face enrollment is an enhancement, not a gate.
 
 **No second OTP inside the face block when embedded in onboarding** — the sign-up OTP already proved mobile possession. (Standalone Workflow A keeps its own OTP stage.)
 
-**Backend note:** the BFF adapter derives `current_step` from these views (`face-consent` / `face-capture`) so a resume-after-abandon lands on the right frame. Shipped and tested.
+**Backend note:** the BFF adapter derives `current_step` from these field keys (and the views as secondary) so a resume-after-abandon lands on the right frame. Shipped and tested.
 
 ## 2. Workflow B — Face Verification (`face_verification_v1`)
 
