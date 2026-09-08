@@ -29,9 +29,15 @@ VEC_ORTHOGONAL = [0.8, -0.7, 0.6, -0.5, 0.4, -0.3, 0.2, -0.1]
 # ---------------------------------------------------------------------------
 
 def _enroll(harness, username=DEMO_USER, mobile=DEMO_MOBILE):
+    #: the credential crosses SEALED (fv-dev1) — the orchestrator forwards the
+    #: envelope unopened and cannot read it, so neither half of the pair lands
+    #: in engine run state. Only fverify opens it.
     return harness.client.post(
         "/api/v1/enrollments",
-        json={"username": username, "password": DEMO_PASSWORD, "mobile": mobile},
+        json={
+            "credential_enc": harness.seal({"username": username, "password": DEMO_PASSWORD}),
+            "mobile": mobile,
+        },
     )
 
 
@@ -291,8 +297,11 @@ def test_unsealed_embedding_is_refused(harness):
 def test_extra_image_like_fields_rejected_everywhere(harness):
     resp = harness.client.post(
         "/api/v1/enrollments",
-        json={"username": DEMO_USER, "password": DEMO_PASSWORD, "mobile": DEMO_MOBILE,
-              "selfie_base64": "AAAA"},
+        json={
+            "credential_enc": harness.seal({"username": DEMO_USER, "password": DEMO_PASSWORD}),
+            "mobile": DEMO_MOBILE,
+            "selfie_base64": "AAAA",
+        },
     )
     assert resp.status_code == 422
 
@@ -365,3 +374,23 @@ def test_face_before_the_stages_is_refused(harness):
     face = _face(harness, enrollment_id)
     assert face.status_code == 409
     assert face.json()["type"] == "urn:face-verify:problem:invalid-stage"
+
+
+def test_plaintext_credential_is_refused(harness):
+    """The seal is not optional. A caller cannot fall back to sending the pair
+    in the clear — which is the whole point: if plaintext were still accepted,
+    an orchestrator carrying it would still be carrying a credential."""
+    resp = harness.client.post(
+        "/api/v1/enrollments",
+        json={"username": DEMO_USER, "password": DEMO_PASSWORD, "mobile": DEMO_MOBILE},
+    )
+    assert resp.status_code == 422
+
+    # ...and an unsealed value in the sealed field is refused too, rather than
+    # being read as-is.
+    resp = harness.client.post(
+        "/api/v1/enrollments",
+        json={"credential_enc": '{"username": "x", "password": "y"}', "mobile": DEMO_MOBILE},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["title"] == "Credential must be sealed"

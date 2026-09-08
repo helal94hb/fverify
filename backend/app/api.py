@@ -23,7 +23,7 @@ from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,11 +45,34 @@ _IMAGE_LIKE_MARKERS = ("image", "selfie", "photo", "picture", "frame", "snapshot
 # ---------------------------------------------------------------------------
 
 class EnrollRequest(BaseModel):
+    """Registration intake. The CREDENTIAL arrives SEALED, never in the clear.
+
+    The orchestrator (Agentys) forwards this envelope unopened and cannot read
+    it: only fverify holds the fv-dev1 private half. That keeps the credential
+    pair — username AND password — out of the engine's run state, which is
+    persisted and browsable, exactly as the OTP and the face embedding already
+    are.
+
+    `mobile` stays in the clear on purpose: it is identity data, which the
+    orchestrator legitimately handles. Authentication material is what never
+    crosses it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: enc1: envelope sealed to fv-dev1, containing {"username": ..., "password": ...}
+    credential_enc: str = Field(min_length=8, max_length=4096)
+    mobile: str = Field(min_length=5, max_length=32)
+
+
+class _Credential(BaseModel):
+    """The unsealed pair. Validated exactly as the plaintext fields were, so
+    the rules did not move when the transport did."""
+
     model_config = ConfigDict(extra="forbid")
 
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=8, max_length=128)
-    mobile: str = Field(min_length=5, max_length=32)
 
 
 class EnrollResponse(BaseModel):
@@ -173,6 +196,41 @@ def _decode_compact_wire(plaintext: bytes) -> list[float]:
     return [((b - 256) if b & 0x80 else b) / 127 for b in raw]
 
 
+def _unseal_credential(credential_enc: str, request: Request) -> "_Credential":
+    """Unseal an `enc1:` credential envelope into a validated username/password.
+
+    Fail-closed in both directions: a payload that is not sealed is refused
+    (so a caller cannot fall back to plaintext), and a sealed payload whose
+    contents do not validate is refused too.
+    """
+    try:
+        plaintext = seal.unseal_envelope(credential_enc, request.app.state.seal_private_key)
+    except seal.SealError as exc:
+        raise ProblemError(
+            422, "invalid-credential-format",
+            "Credential must be sealed",
+            f"The credential must be sent in an enc1: envelope: {exc}",
+        ) from exc
+
+    try:
+        payload = json.loads(plaintext)
+    except json.JSONDecodeError as exc:
+        raise ProblemError(
+            422, "invalid-credential-format",
+            "Credential must be sealed",
+            "The sealed credential is not valid JSON.",
+        ) from exc
+
+    try:
+        return _Credential.model_validate(payload)
+    except ValidationError as exc:
+        raise ProblemError(
+            422, "invalid-credential",
+            "Credential rejected",
+            "The sealed credential does not meet the username/password rules.",
+        ) from exc
+
+
 def _unseal_embedding(embedding_enc: str, request: Request) -> list[float]:
     """Unseal an `enc1:` payload into a validated float vector. Fail-closed."""
     try:
@@ -249,7 +307,7 @@ async def _audit(
 # ---------------------------------------------------------------------------
 
 @router.post("/enrollments", status_code=201, response_model=EnrollResponse)
-async def create_enrollment(body: EnrollRequest, session: SessionDep):
+async def create_enrollment(body: EnrollRequest, session: SessionDep, request: Request):
     """PURE IDENTITY registration (owner ruling 2026-08-31): this blackbox
     knows ONLY user identity — username, credential, face, OTP. No customer
     ids, no core banking, no T24 anywhere: the username ↔ customer_id linkage
@@ -259,8 +317,12 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep):
     identity record. OTP generation is handled by the dedicated
     POST /enrollments/{id}/otp/generate endpoint.
     """
+    #: the credential is opened HERE and nowhere else — the orchestrator that
+    #: carried it cannot read it, and it is never persisted in the clear.
+    cred = _unseal_credential(body.credential_enc, request)
+
     existing = await session.scalar(
-        select(Enrollment).where(Enrollment.username == body.username)
+        select(Enrollment).where(Enrollment.username == cred.username)
     )
     if existing is not None:
         # Idempotent — return the existing enrollment.
@@ -271,8 +333,8 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep):
         )
 
     enrollment = Enrollment(
-        username=body.username,
-        password_hash=otp.hash_secret(body.password),
+        username=cred.username,
+        password_hash=otp.hash_secret(cred.password),
         mobile=body.mobile,
         status="awaiting_otp",
     )
@@ -280,7 +342,7 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep):
     await session.flush()
     await _audit(
         session,
-        username=body.username,
+        username=cred.username,
         enrollment_id=enrollment.id,
         event="enrollment",
         outcome="created",
