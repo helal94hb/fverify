@@ -78,6 +78,18 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     #: a relay attack.
     verify_challenge_ttl_seconds: int = 120
 
+    #: 1:N DEDUPLICATION. Search each new face against the enrolled gallery
+    #: before accepting it, so one person cannot hold two identities.
+    #: `customer_id` cannot catch this case: the fraud is one HUMAN using two
+    #: different identity documents, and only the biometric links them.
+    dedup_enabled: bool = True
+
+    #: Deliberately ABOVE the 0.8 verification threshold. Dedup errs toward
+    #: precision because a false positive blocks a real customer at the last
+    #: step of onboarding, while a false negative is caught later by review.
+    #: Tuning this is a risk decision, not an engineering one.
+    dedup_threshold: float = 0.85
+
     # Verification attempt cap: max failed attempts per username per window
     # (owner ruling 2026-08-31: 3 retries, then the lockout).
     verify_max_attempts: int = 3

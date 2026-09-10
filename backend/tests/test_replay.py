@@ -10,7 +10,14 @@ succeeding once first — a replay test that never demonstrates the original
 success has not shown that replay was possible.
 """
 
-from tests.test_api import DEMO_USER, VEC_A, _challenge, _enroll_with_face, _verify  # noqa: F401
+from tests.test_api import (  # noqa: F401
+    DEMO_USER,
+    VEC_A,
+    VEC_ORTHOGONAL,
+    _challenge,
+    _enroll_with_face,
+    _verify,
+)
 
 
 def test_the_same_envelope_cannot_be_used_twice(harness):
@@ -87,7 +94,10 @@ def test_a_nonce_swapped_onto_a_captured_envelope_breaks_the_tag(harness):
 
 def test_a_challenge_issued_to_one_user_does_not_work_for_another(harness):
     _enroll_with_face(harness, username=DEMO_USER)
-    _enroll_with_face(harness, username="other_person", vec=VEC_A)
+    #: a DIFFERENT face. Two people cannot share one, and since 1:N dedup
+    #: landed the service refuses the attempt outright -- which is the correct
+    #: behaviour and made this setup invalid.
+    _enroll_with_face(harness, username="other_person", vec=VEC_ORTHOGONAL)
 
     stolen = _challenge(harness, username="other_person")
     r = harness.client.post(

@@ -210,6 +210,53 @@ def _decode_compact_wire(plaintext: bytes) -> list[float]:
     return [((b - 256) if b & 0x80 else b) / 127 for b in raw]
 
 
+async def _find_duplicate(
+    session, embedding: list[float], own_enrollment_id: str, settings: Settings
+) -> tuple[str, float] | None:
+    """1:N search of the enrolled gallery. Returns (enrollment_id, score) or None.
+
+    THE CASE customer_id CANNOT SEE. A duplicate keyed on customer_id catches
+    the same identity enrolling twice; this catches one HUMAN holding two
+    different identities, which is the fraud that matters — splitting
+    transactions, evading limits, and defeating the single customer view FATF
+    Recommendation 10 requires.
+
+    Only ACTIVE templates are searched. A revoked template belongs to a
+    retired binding and must not block its owner from enrolling again.
+
+    COST, STATED HONESTLY: this decrypts every active template on every
+    enrolment — O(N) with the gallery. Correct and fast enough at this scale,
+    and the wrong shape at national scale, where this becomes a vector index
+    with a review queue in front of it. The threshold and the review workflow
+    are the parts that need a risk owner, not the search.
+    """
+    if not settings.dedup_enabled:
+        return None
+
+    fernet = crypto.get_fernet(settings.at_rest_key)
+    rows = await session.scalars(
+        select(FaceTemplate).where(
+            FaceTemplate.revoked_at.is_(None),
+            FaceTemplate.enrollment_id != own_enrollment_id,
+        )
+    )
+    best: tuple[str, float] | None = None
+    for row in rows:
+        try:
+            other = crypto.decrypt_embedding(row.embedding_encrypted, fernet)
+        except Exception:          # noqa: BLE001 - a corrupt row must not
+            continue               # block enrolment, but must not match either
+        if len(other) != len(embedding):
+            continue               # different model or dimension: not comparable
+        score = match.cosine_similarity(other, embedding)
+        if best is None or score > best[1]:
+            best = (row.enrollment_id, score)
+
+    if best and best[1] >= settings.dedup_threshold:
+        return best
+    return None
+
+
 async def _active_template(session, enrollment: Enrollment) -> bytes | None:
     """The one template that may be matched against — or None.
 
@@ -550,6 +597,33 @@ async def submit_face(
     embedding = _unseal_embedding(body.embedding_enc, request)
 
     settings: Settings = get_settings()
+
+    #: DEDUP BEFORE STORING. Checked here rather than after, so a duplicate is
+    #: never written and then cleaned up — the gallery must not briefly contain
+    #: two faces for one person.
+    duplicate = await _find_duplicate(session, embedding, enrollment.id, settings)
+    if duplicate is not None:
+        other_id, score = duplicate
+        #: The matched identity goes in the AUDIT, never in the response. An
+        #: enroller who learns WHICH identity they matched has been handed
+        #: someone else's banking relationship.
+        await _audit(
+            session, username=enrollment.username, enrollment_id=enrollment.id,
+            event="face_submission", outcome="duplicate",
+            detail=f"matched={other_id} score={score:.4f}",
+        )
+        await session.commit()
+        #: Non-specific on purpose. Confirming "this face is already enrolled"
+        #: turns the endpoint into an oracle for whether a given person banks
+        #: here. Reaching this point already costs a full identity journey, so
+        #: the oracle is expensive — but it should not be free either.
+        raise ProblemError(
+            409,
+            "enrollment-not-permitted",
+            "This enrollment cannot be completed",
+            "Please contact support to continue.",
+        )
+
     sealed_at_rest = crypto.encrypt_embedding(
         embedding, crypto.get_fernet(settings.at_rest_key)
     )
