@@ -87,10 +87,24 @@ def _enroll_with_face(harness, username=DEMO_USER, vec=VEC_A):
     return enrollment_id
 
 
-def _verify(harness, vec, username=DEMO_USER):
+def _challenge(harness, username=DEMO_USER):
+    r = harness.client.post("/api/v1/verifications/challenge",
+                            json={"username": username})
+    assert r.status_code == 200, r.json()
+    return r.json()["nonce"]
+
+
+def _verify(harness, vec, username=DEMO_USER, nonce=None):
+    """Verification now requires a fresh challenge sealed INTO the envelope.
+
+    enc2 by necessity: enc1 has no authenticated field to carry a nonce, and a
+    nonce travelling beside the payload could simply be swapped by a replayer.
+    """
+    if nonce is None:
+        nonce = _challenge(harness, username)
     return harness.client.post(
         "/api/v1/verifications",
-        json={"username": username, "embedding_enc": harness.seal(vec)},
+        json={"username": username, "embedding_enc": harness.seal_v2(vec, nonce)},
     )
 
 

@@ -29,6 +29,19 @@ def seal_payload(public_key: rsa.RSAPublicKey, payload) -> str:
     return "enc1:" + base64.urlsafe_b64encode(json.dumps(envelope).encode()).rstrip(b"=").decode()
 
 
+def seal_hybrid_payload(public_key: rsa.RSAPublicKey, payload, nonce=None) -> str:
+    """Client-side sealer for enc2 — the format `/verifications` requires.
+
+    Verification carries a real embedding AND a challenge nonce; enc1 can do
+    neither (318-byte ceiling, and no authenticated field to put a nonce in).
+    """
+    from app import seal as _seal
+
+    return _seal.seal_hybrid(
+        json.dumps(payload).encode(), public_key, "test-key", nonce=nonce
+    )
+
+
 def seal_string(public_key: rsa.RSAPublicKey, plaintext: str) -> str:
     """Seal a plain string (e.g. an OTP code) into an enc1: envelope."""
     oaep = padding.OAEP(
@@ -52,6 +65,10 @@ class Harness:
     def seal(self, payload) -> str:
         """Seal a JSON payload (embedding vector) into an enc1: envelope."""
         return seal_payload(self.public_key, payload)
+
+    def seal_v2(self, payload, nonce=None) -> str:
+        """Seal into an enc2: envelope, optionally bound to a challenge nonce."""
+        return seal_hybrid_payload(self.public_key, payload, nonce)
 
     def seal_otp(self, code: str) -> str:
         """Seal a plain-text OTP code into an enc1: envelope (mobile app sim)."""

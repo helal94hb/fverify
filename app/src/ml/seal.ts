@@ -29,6 +29,9 @@ import forge from 'node-forge';
 const PREFIX = 'enc1:';
 const ALG = 'RSA-OAEP-SHA-256';
 
+const PREFIX_HYBRID = 'enc2:';
+const ALG_HYBRID = 'RSA-OAEP-SHA-256+A256GCM';
+
 /** Key id the bundled dev key is registered under on the backend. */
 export const SEAL_KEY_ID = 'fv-dev1';
 
@@ -83,4 +86,57 @@ export function seal(
   });
   const envelope = JSON.stringify({ v: 1, alg: ALG, k: keyId, ct: base64url(ciphertext) });
   return PREFIX + base64url(forge.util.encodeUtf8(envelope));
+}
+
+/**
+ * enc2 — the HYBRID envelope, for payloads RSA-OAEP cannot carry.
+ *
+ * Nothing needs it at EMBEDDING_DIM = 128: the compact wire encoding is 172
+ * characters and enc1 holds 318 on the RSA-3072 key. It exists so the model can
+ * move: a 512-dim ArcFace-class vector is ~684 characters even at one signed
+ * byte per dimension, 2.2x over the ceiling, and no bigger RSA key reaches it
+ * (RSA-4096 gives 446 bytes).
+ *
+ * Shrinking the vector instead is the alternative and it is the worse one — the
+ * same envelope carries the embedding at TRANSACTION time, so the envelope would
+ * be bounding the accuracy of every future face check against a payment.
+ *
+ * Fresh AES-256 content key per envelope, RSA-wrapped; AES-256-GCM over the
+ * payload; the key id passed as ADDITIONAL DATA so it is authenticated rather
+ * than merely carried. Keep in lockstep with backend/app/seal.py —
+ * __tests__/interop.test.ts and backend/tests/test_interop.py are what hold the
+ * two implementations honest.
+ */
+export function sealHybrid(
+  plaintext: string,
+  publicKeyPem: string = DEV_PUBLIC_KEY_PEM,
+  keyId: string = SEAL_KEY_ID,
+): string {
+  const publicKey = forge.pki.publicKeyFromPem(publicKeyPem.replace(/\\n/g, '\n'));
+
+  const contentKey = forge.random.getBytesSync(32);   // AES-256
+  const iv = forge.random.getBytesSync(12);           // 96-bit nonce
+
+  const cipher = forge.cipher.createCipher('AES-GCM', contentKey);
+  cipher.start({ iv, additionalData: keyId, tagLength: 128 });
+  cipher.update(forge.util.createBuffer(forge.util.encodeUtf8(plaintext)));
+  cipher.finish();
+
+  // ciphertext||tag — the layout python's AESGCM primitive expects
+  const ct = cipher.output.getBytes() + cipher.mode.tag.getBytes();
+
+  const ek = publicKey.encrypt(contentKey, 'RSA-OAEP', {
+    md: forge.md.sha256.create(),
+    mgf1: forge.mgf.mgf1.create(forge.md.sha256.create()),
+  });
+
+  const envelope = JSON.stringify({
+    v: 2,
+    alg: ALG_HYBRID,
+    k: keyId,
+    ek: base64url(ek),
+    iv: base64url(iv),
+    ct: base64url(ct),
+  });
+  return PREFIX_HYBRID + base64url(forge.util.encodeUtf8(envelope));
 }

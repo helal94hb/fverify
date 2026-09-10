@@ -73,6 +73,11 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     # 2026-08-31: 0.80).
     match_threshold: float = 0.8
 
+    #: How long a verification challenge stays usable. Short on purpose: it only
+    #: has to cover one capture-and-submit, and every extra second is window for
+    #: a relay attack.
+    verify_challenge_ttl_seconds: int = 120
+
     # Verification attempt cap: max failed attempts per username per window
     # (owner ruling 2026-08-31: 3 retries, then the lockout).
     verify_max_attempts: int = 3
