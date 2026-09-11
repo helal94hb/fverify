@@ -21,7 +21,7 @@ import json
 import math
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -397,6 +397,93 @@ async def _audit(
 # Enrollment — pure identity registration
 # ---------------------------------------------------------------------------
 
+async def _last_activity(session: AsyncSession, enrollment: Enrollment) -> datetime:
+    """The most recent sign of life on this enrolment.
+
+    There is no `updated_at` on the row, so this reads the marks each stage
+    leaves behind — the record's birth, the code that was minted for it, the
+    consent it recorded. Approximate by construction, and deliberately biased
+    towards LATER: over-estimating activity means declining to erase something
+    that might still be running, which is the safe direction to be wrong in.
+    """
+    marks = [enrollment.created_at]
+    if enrollment.consent_at is not None:
+        marks.append(enrollment.consent_at)
+    record = await session.get(OtpRecord, enrollment.id)
+    if record is not None:
+        marks.append(record.created_at)
+    return max(marks)
+
+
+async def _abandoned(
+    session: AsyncSession, enrollment: Enrollment, settings: Settings
+) -> bool:
+    """Is this an abandoned sign-up — safe to erase and begin again?
+
+    THREE conditions, and each excludes a case that must NOT be erased:
+
+    `enrolled` is finished, whatever became of the run that produced it. The
+    customer did everything asked of them; if the last message never reached
+    them, the bank's sign-in check completes it. Erasing here would destroy a
+    real customer's face binding for want of a notification (owner ruling
+    2026-09-10: erase the unfinished only).
+
+    A record with TEMPLATE HISTORY has been enrolled before and is sitting at
+    `awaiting_face` because its binding was REVOKED — a customer replacing a
+    lost phone, who has already proved their number and consented. Revocation
+    deliberately does not send them back to the start; erasing the attempt
+    would, and re-asking for a code they already proved is theatre.
+
+    Anything RECENT may still be running. Two devices, or one slow customer:
+    erasing the attempt out from under a live journey would invalidate the code
+    they are in the middle of typing.
+    """
+    if enrollment.status == "enrolled":
+        return False
+    has_history = await session.scalar(
+        select(func.count())
+        .select_from(FaceTemplate)
+        .where(FaceTemplate.enrollment_id == enrollment.id)
+    )
+    if has_history:
+        return False
+    idle = utcnow() - await _last_activity(session, enrollment)
+    return idle >= timedelta(seconds=settings.enrolment_restart_after_seconds)
+
+
+async def _erase_the_attempt(
+    session: AsyncSession,
+    enrollment: Enrollment,
+    cred: "_Credential",
+    mobile: str,
+) -> None:
+    """Wipe the abandoned attempt and put the record back at the beginning.
+
+    Everything the attempt produced goes: the live code, the consent, the
+    credential (they may well choose a different one this time), and the phone
+    number they gave it.
+
+    What survives is the AUDIT — this enrolment's history of attempts, and any
+    revoked template that predates them. "Erase everything" cannot be allowed to
+    mean erasing the evidence that any of it happened; an investigator asking
+    "what did this identity do" must still get an answer.
+
+    The row keeps its id on purpose, so that history reads as one identity
+    making several attempts rather than as several unrelated identities.
+    """
+    record = await session.get(OtpRecord, enrollment.id)
+    if record is not None:
+        await session.delete(record)
+
+    enrollment.password_hash = passwords.hash_password(cred.password)
+    enrollment.mobile = mobile
+    enrollment.consent_version = None
+    enrollment.consent_at = None
+    enrollment.embedding_encrypted = None
+    enrollment.enrolled_at = None
+    enrollment.status = "awaiting_otp"
+
+
 @router.post("/enrollments", status_code=201, response_model=EnrollResponse)
 async def create_enrollment(body: EnrollRequest, session: SessionDep, request: Request):
     """PURE IDENTITY registration (owner ruling 2026-08-31): this blackbox
@@ -416,6 +503,24 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
         select(Enrollment).where(Enrollment.username == cred.username)
     )
     if existing is not None:
+        settings = get_settings()
+        if await _abandoned(session, existing, settings):
+            #: START AGAIN FROM THE BEGINNING (owner ruling 2026-09-10). The
+            #: attempt behind this record was never finished and its run has
+            #: expired, so nobody was ever told they were enrolled and there is
+            #: nothing here to protect. Handing it back instead is what used to
+            #: trap people: the record would return at, say, the face stage and
+            #: the very next call would refuse it for not being at the OTP
+            #: stage, leaving a customer who could neither continue nor restart.
+            await _erase_the_attempt(session, existing, cred, body.mobile)
+            await _audit(
+                session,
+                username=cred.username,
+                enrollment_id=existing.id,
+                event="enrollment",
+                outcome="restarted",
+            )
+            await session.commit()
         # Idempotent — return the existing enrollment.
         return EnrollResponse(
             enrollment_id=existing.id,
