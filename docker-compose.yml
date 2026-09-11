@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  fverify-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fverify
+    ports:
+      - "8400:8400"
+    volumes:
+      - fverify-data:/app/data
+    environment:
+      # Map the database to the volume we created so it persists between restarts
+      - FV_DATABASE_URL=sqlite+aiosqlite:////app/data/face-verify.db
+      
+      # WARNING: Use real, securely generated keys for production!
+      # FV_AT_REST_KEY: "..."
+      # FV_SEAL_PRIVATE_KEY_PEM: "..."
+      # FV_OTP_EXPORT_KEY: "..."
+    restart: unless-stopped
+
+volumes:
+  fverify-data:
