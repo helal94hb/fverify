@@ -103,18 +103,6 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     otp_live: bool = False
     otp_stub_code: str = "123456"
     otp_ttl_seconds: int = 600
-
-    #: HOW LONG AN UNFINISHED SIGN-UP IS TREATED AS STILL LIVE (owner ruling
-    #: 2026-09-10). Past this, a new attempt for the same username ERASES the
-    #: abandoned one and starts from the beginning rather than handing back a
-    #: half-finished record the next stage will refuse.
-    #:
-    #: Defaulted to the orchestrator's own wait window: a flow left waiting
-    #: there expires at thirty minutes, so an attempt older than that has no
-    #: run behind it and cannot be continued by anybody. Shorter would erase
-    #: journeys that are still runnable; longer would leave people stranded
-    #: for the difference.
-    enrolment_restart_after_seconds: int = 1800
     otp_max_verify_attempts: int = 5
     otp_resend_cooldown_seconds: int = 60
     #: salt for one-time-secret hashing (env-overridden per environment)

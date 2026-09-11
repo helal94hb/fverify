@@ -17,7 +17,6 @@ being fixed.
 import sqlite3
 from datetime import timedelta
 
-from app.config import get_settings
 from app.models import utcnow
 from tests.test_api import (
     DEMO_MOBILE,
@@ -68,8 +67,14 @@ def _restart(harness, password: str = DEMO_PASSWORD, mobile: str = DEMO_MOBILE):
 
 
 def test_an_abandoned_attempt_is_erased_and_begins_again(harness):
-    """THE rule. Walked away after consent, came back later — and gets a clean
-    start rather than a record the next step will refuse."""
+    """Walked away after consent, came back later — a clean start rather than a
+    record the next step will refuse.
+
+    This was THE rule when restarting required thirty minutes' silence. Under
+    the 2026-09-11 ruling it is one CASE of the rule (any unfinished attempt is
+    superseded), kept because an old record must keep restarting too — the
+    ruling widened the door and must not have moved it.
+    """
     eid = _enroll(harness).json()["enrollment_id"]
     _generate_and_verify_otp(harness, eid)
     assert _consent(harness, eid).status_code == 200
@@ -211,35 +216,52 @@ def test_a_revoked_enrolment_is_never_erased(harness):
     assert consent == "v1", "re-asking for a consent already given is theatre"
 
 
-def test_a_live_attempt_is_never_erased(harness):
-    """Two devices, or one slow customer. Erasing the attempt out from under a
-    running journey would invalidate the code they are in the middle of typing —
-    so recency is checked, not just the stage."""
+def test_a_new_attempt_kills_the_one_in_flight(harness):
+    """OWNER RULING 2026-09-11, and the exact path run 2915550e died on.
+
+    This test used to assert the OPPOSITE — that a recent journey is "handed
+    back" at `awaiting_face`. That is the state the flow's very next node
+    refuses with 409 invalid-stage, so the customer could neither continue nor
+    start over, and the test was holding the trap shut.
+
+    NO AGEING HERE, deliberately: the record is seconds old. Elapsed time used
+    to decide this and no longer does — a customer starting again is the only
+    signal that matters.
+    """
     eid = _enroll(harness).json()["enrollment_id"]
     _generate_and_verify_otp(harness, eid)
     assert _consent(harness, eid).status_code == 200
+    assert _status(harness) == "awaiting_face"
 
     again = _restart(harness)
 
     assert again.status_code == 201
-    assert again.json()["status"] == "awaiting_face", "the live journey is handed back"
-    assert _status(harness) == "awaiting_face"
+    assert again.json()["enrollment_id"] == eid, "one identity, one record"
+    assert again.json()["status"] == "awaiting_otp", "the in-flight attempt was killed"
+    assert _status(harness) == "awaiting_otp"
+    #: THE POINT. This is the call that returned 409 in run 2915550e, because
+    #: the record came back past the OTP stage. It must now succeed.
+    assert _otp_generate(harness, eid).status_code == 200
 
 
-def test_the_window_is_configurable_and_the_control_notices(harness, monkeypatch):
-    """The default follows the orchestrator's own wait window. A deployment that
-    moves one must be able to move the other — and a setting nothing reads is
-    indistinguishable from one that is ignored."""
-    settings = get_settings()
+def test_elapsed_time_does_not_decide_this_any_more(harness):
+    """The window is gone, and this is what replaced its test.
+
+    `enrolment_restart_after_seconds` was removed rather than widened: a
+    setting nothing reads is indistinguishable from one that is ignored. What
+    matters now is that a FRESH record and an OLD one restart identically — if
+    ageing still changed the answer anywhere, the window would have survived in
+    spirit while claiming not to.
+    """
     eid = _enroll(harness).json()["enrollment_id"]
     _generate_and_verify_otp(harness, eid)
     assert _consent(harness, eid).status_code == 200
+
+    #: seconds old
+    assert _restart(harness).json()["status"] == "awaiting_otp"
+
+    #: and again, this time long abandoned — the SAME answer
+    _generate_and_verify_otp(harness, eid)
+    assert _consent(harness, eid).status_code == 200
     _age(harness, eid, minutes=45)
-
-    #: an hour's patience: the same record is NOT yet abandoned
-    monkeypatch.setattr(settings, "enrolment_restart_after_seconds", 3600)
-    assert _restart(harness).json()["status"] == "awaiting_face"
-
-    #: the shipped window: it is
-    monkeypatch.setattr(settings, "enrolment_restart_after_seconds", 1800)
     assert _restart(harness).json()["status"] == "awaiting_otp"

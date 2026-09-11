@@ -21,7 +21,7 @@ import json
 import math
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -397,46 +397,40 @@ async def _audit(
 # Enrollment — pure identity registration
 # ---------------------------------------------------------------------------
 
-async def _last_activity(session: AsyncSession, enrollment: Enrollment) -> datetime:
-    """The most recent sign of life on this enrolment.
+async def _superseded(session: AsyncSession, enrollment: Enrollment) -> bool:
+    """Does a NEW enrolment attempt replace this record?
 
-    There is no `updated_at` on the row, so this reads the marks each stage
-    leaves behind — the record's birth, the code that was minted for it, the
-    consent it recorded. Approximate by construction, and deliberately biased
-    towards LATER: over-estimating activity means declining to erase something
-    that might still be running, which is the safe direction to be wrong in.
-    """
-    marks = [enrollment.created_at]
-    if enrollment.consent_at is not None:
-        marks.append(enrollment.consent_at)
-    record = await session.get(OtpRecord, enrollment.id)
-    if record is not None:
-        marks.append(record.created_at)
-    return max(marks)
+    OWNER RULING 2026-09-11: yes, whenever the record is unfinished. A customer
+    who starts again has started again — the attempt behind the old record is
+    dead the moment they do, and holding it open is what strands them.
 
+    This REPLACES a thirty-minute idle window. The window was the defect: run
+    2915550e found this record at `awaiting_face` fifteen minutes after the
+    attempt that left it there, handed it back, and the flow's next node — which
+    always generates an OTP — was refused with 409 invalid-stage. The customer
+    could neither continue (the stage was wrong) nor restart (the record was too
+    recent). It also self-perpetuated, because every attempt that minted a code
+    pushed the idle clock forward again.
 
-async def _abandoned(
-    session: AsyncSession, enrollment: Enrollment, settings: Settings
-) -> bool:
-    """Is this an abandoned sign-up — safe to erase and begin again?
+    TWO cases are still excluded, and they are not timing rules:
 
-    THREE conditions, and each excludes a case that must NOT be erased:
+    `enrolled` is FINISHED, not in flight. The customer did everything asked of
+    them; erasing that because somebody typed the username again would destroy a
+    real face binding (owner ruling 2026-09-10: erase the unfinished only).
 
-    `enrolled` is finished, whatever became of the run that produced it. The
-    customer did everything asked of them; if the last message never reached
-    them, the bank's sign-in check completes it. Erasing here would destroy a
-    real customer's face binding for want of a notification (owner ruling
-    2026-09-10: erase the unfinished only).
+    A record with TEMPLATE HISTORY has been enrolled before and sits at
+    `awaiting_face` because its binding was REVOKED — someone replacing a lost
+    phone, who has already proved their number and consented. Revocation
+    deliberately does not send them back to the start.
+    NOTE, and it is a real gap rather than a settled decision: through the
+    current flow that customer meets the SAME trap this ruling fixes, because
+    the flow always asks for an OTP next and their record is past that stage.
+    Erasing them here would fix the symptom by making them re-prove a phone they
+    already proved, which is why it is NOT done on this ruling's authority.
 
-    A record with TEMPLATE HISTORY has been enrolled before and is sitting at
-    `awaiting_face` because its binding was REVOKED — a customer replacing a
-    lost phone, who has already proved their number and consented. Revocation
-    deliberately does not send them back to the start; erasing the attempt
-    would, and re-asking for a code they already proved is theatre.
-
-    Anything RECENT may still be running. Two devices, or one slow customer:
-    erasing the attempt out from under a live journey would invalidate the code
-    they are in the middle of typing.
+    THE ACCEPTED COST: two devices. If the identity is genuinely mid-journey
+    elsewhere, the newer attempt wins and the older one's code stops working.
+    That is the ruling — a stranded customer is worse than an invalidated code.
     """
     if enrollment.status == "enrolled":
         return False
@@ -445,10 +439,7 @@ async def _abandoned(
         .select_from(FaceTemplate)
         .where(FaceTemplate.enrollment_id == enrollment.id)
     )
-    if has_history:
-        return False
-    idle = utcnow() - await _last_activity(session, enrollment)
-    return idle >= timedelta(seconds=settings.enrolment_restart_after_seconds)
+    return not has_history
 
 
 async def _erase_the_attempt(
@@ -503,15 +494,16 @@ async def create_enrollment(body: EnrollRequest, session: SessionDep, request: R
         select(Enrollment).where(Enrollment.username == cred.username)
     )
     if existing is not None:
-        settings = get_settings()
-        if await _abandoned(session, existing, settings):
-            #: START AGAIN FROM THE BEGINNING (owner ruling 2026-09-10). The
-            #: attempt behind this record was never finished and its run has
-            #: expired, so nobody was ever told they were enrolled and there is
-            #: nothing here to protect. Handing it back instead is what used to
-            #: trap people: the record would return at, say, the face stage and
-            #: the very next call would refuse it for not being at the OTP
-            #: stage, leaving a customer who could neither continue nor restart.
+        if await _superseded(session, existing):
+            #: START AGAIN FROM THE BEGINNING (owner rulings 2026-09-10 and
+            #: 2026-09-11). The attempt behind this record was never finished,
+            #: so nobody was ever told they were enrolled and there is nothing
+            #: here to protect. Handing it back is what trapped people: the
+            #: record came back at, say, the face stage and the very next call
+            #: refused it for not being at the OTP stage, leaving a customer who
+            #: could neither continue nor restart. That used to require the
+            #: record to be STALE; it no longer does, because a customer
+            #: starting again is the only signal that matters.
             await _erase_the_attempt(session, existing, cred, body.mobile)
             await _audit(
                 session,
