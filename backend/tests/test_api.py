@@ -79,7 +79,37 @@ def _generate_and_verify_otp(harness, enrollment_id):
     return verify
 
 
+def _activate(harness, enrollment_id):
+    """The step the ORCHESTRATOR takes once the bank has a profile.
+
+    No customer performs this. It exists because this service must never know
+    about the bank, so it cannot look and see whether a profile was made — it
+    can only be told.
+    """
+    return harness.client.post(f"/api/v1/enrollments/{enrollment_id}/activate")
+
+
 def _enroll_with_face(harness, username=DEMO_USER, vec=VEC_A):
+    """A COMPLETE enrolment — including the close-out (2026-09-11).
+
+    The activate call is new here, and its absence is why seven tests across
+    four files went red: submitting a face used to finish an enrolment, and now
+    it stops at `awaiting_activation` and waits for the bank. Every caller of
+    this helper wants a USABLE identity, so the helper carries the whole
+    journey; the tests that want to watch the middle state drive the steps
+    themselves.
+    """
+    enrollment_id = _enroll_up_to_face(harness, username, vec)
+    assert _activate(harness, enrollment_id).status_code == 200
+    return enrollment_id
+
+
+def _enroll_up_to_face(harness, username=DEMO_USER, vec=VEC_A):
+    """Everything the CUSTOMER does, and nothing after it.
+
+    Lands on `awaiting_activation`: the person has finished and the enrolment
+    has not.
+    """
     enrollment_id = _enroll(harness, username).json()["enrollment_id"]
     _generate_and_verify_otp(harness, enrollment_id)
     assert _consent(harness, enrollment_id).status_code == 200

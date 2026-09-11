@@ -31,7 +31,12 @@ class Enrollment(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(128))
     mobile: Mapped[str] = mapped_column(String(32))
-    status: Mapped[str] = mapped_column(String(16), default="awaiting_otp")
+    #: 32 rather than 16: the stage machine gained `awaiting_activation`
+    #: (19 characters) when `enrolled` was split into "the customer is done"
+    #: and "everything is done". Widened rather than contorting the name —
+    #: a state whose name has to be abbreviated to fit its column is a state
+    #: somebody will misread.
+    status: Mapped[str] = mapped_column(String(32), default="awaiting_otp")
 
     # Consent is REQUIRED before any face data is accepted — recorded at its
     # own step AFTER the OTP proves the phone (nullable until then).
@@ -42,7 +47,21 @@ class Enrollment(Base):
     embedding_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    #: when this enrolment was last FINISHED. Cleared by revocation, because a
+    #: revoked enrolment is not finished any more.
     enrolled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    #: WHEN THE BANK FIRST PROVISIONED FOR THIS IDENTITY, and the one fact here
+    #: that nothing ever un-sets (2026-09-11).
+    #:
+    #: It answers a question `enrolled_at` cannot: revocation clears that, so
+    #: after a lost device the record cannot say whether the bank once made a
+    #: profile or never did. The two need different treatment — someone
+    #: re-binding a face already HAS a profile, and sending them back to wait
+    #: for the bank would ask it to create a customer it created months ago.
+    #:
+    #: A TIMESTAMP AND NOTHING MORE. It records that an activation happened,
+    #: never who for: no customer id lives in this service.
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class AuditEvent(Base):

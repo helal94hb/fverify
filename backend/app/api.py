@@ -122,7 +122,12 @@ class FaceSubmitRequest(BaseModel):
 
 class FaceSubmitResponse(BaseModel):
     status: str
-    enrolled_at: str
+    #: NULLABLE since the stage machine gained `awaiting_activation`: a face
+    #: submission no longer ends the enrolment, so at that point there is no
+    #: finish time to report. Empty is the honest answer — a timestamp here
+    #: would be the moment the CUSTOMER finished wearing the name of the moment
+    #: the ENROLMENT did.
+    enrolled_at: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -418,10 +423,20 @@ async def _superseded(session: AsyncSession, enrollment: Enrollment) -> bool:
     them; erasing that because somebody typed the username again would destroy a
     real face binding (owner ruling 2026-09-10: erase the unfinished only).
 
-    A record with TEMPLATE HISTORY has been enrolled before and sits at
+    A record the BANK HAS PROVISIONED FOR has been enrolled before and sits at
     `awaiting_face` because its binding was REVOKED — someone replacing a lost
     phone, who has already proved their number and consented. Revocation
     deliberately does not send them back to the start.
+
+    THAT TEST USED TO BE "has any template history", and the difference is the
+    whole reason this ruling reaches anybody (2026-09-11). A customer waiting on
+    an activation that never came HAS submitted a face, so they have template
+    history, so the old test protected them from a restart they urgently needed
+    — the exact stranding this function exists to prevent, arriving by the one
+    route nobody had looked at. `activated_at` distinguishes the two directly
+    rather than inferring it: it is set only by the bank's close-out, so it
+    means "a profile exists for this identity" and never merely "a face was
+    once submitted".
     NOTE, and it is a real gap rather than a settled decision: through the
     current flow that customer meets the SAME trap this ruling fixes, because
     the flow always asks for an OTP next and their record is past that stage.
@@ -434,12 +449,7 @@ async def _superseded(session: AsyncSession, enrollment: Enrollment) -> bool:
     """
     if enrollment.status == "enrolled":
         return False
-    has_history = await session.scalar(
-        select(func.count())
-        .select_from(FaceTemplate)
-        .where(FaceTemplate.enrollment_id == enrollment.id)
-    )
-    return not has_history
+    return enrollment.activated_at is None
 
 
 async def _erase_the_attempt(
@@ -472,6 +482,10 @@ async def _erase_the_attempt(
     enrollment.consent_at = None
     enrollment.embedding_encrypted = None
     enrollment.enrolled_at = None
+    #: belt and braces: `_superseded` only sends never-activated records here,
+    #: so this is already None. Cleared anyway so "erase the attempt" stays
+    #: true if that rule ever loosens.
+    enrollment.activated_at = None
     enrollment.status = "awaiting_otp"
 
 
@@ -667,6 +681,66 @@ async def record_consent(enrollment_id: str, body: ConsentRequest, session: Sess
     return StageResponse(status=enrollment.status)
 
 
+@router.post("/enrollments/{enrollment_id}/activate", response_model=FaceSubmitResponse)
+async def activate_enrollment(enrollment_id: str, session: SessionDep):
+    """THE LAST STEP, and the only one no customer performs.
+
+    Called by the orchestrator once the bank has a profile for this identity.
+    Until it lands the record sits at `awaiting_activation`: the customer has
+    done everything asked of them and the enrolment is still not finished.
+
+    WHY THIS EXISTS AT ALL. This service must never know about the bank (owner
+    ruling 2026-09-08), so it cannot look and see whether a profile was made. It
+    can only be TOLD. The alternative — treating a submitted face as the end —
+    is what let an identity look complete while the bank had never heard of it,
+    and left that customer unable to start again because `_superseded` protects
+    the finished.
+
+    IDEMPOTENT, because the caller is a workflow step and a workflow step gets
+    retried. Finishing twice must cost nothing and must not move `enrolled_at`,
+    which records when the enrolment finished and only ever happens once.
+    """
+    enrollment = await session.get(Enrollment, enrollment_id)
+    if enrollment is None:
+        raise ProblemError(
+            404, "enrollment-not-found", "Enrollment not found", "No such enrollment."
+        )
+    if enrollment.status == "enrolled":
+        return FaceSubmitResponse(
+            status="enrolled",
+            enrolled_at=enrollment.enrolled_at.isoformat() if enrollment.enrolled_at else None,
+        )
+    if enrollment.status != "awaiting_activation":
+        #: FAIL CLOSED. Anything earlier means the customer has not finished,
+        #: and marking such a record enrolled would hand out a working identity
+        #: for a face that was never submitted.
+        raise ProblemError(
+            409,
+            "invalid-stage",
+            "This enrollment cannot be activated yet",
+            "The face step has not been completed.",
+        )
+
+    enrollment.status = "enrolled"
+    enrollment.enrolled_at = utcnow()
+    #: the permanent half. `enrolled_at` says the enrolment is finished NOW and
+    #: revocation clears it; this says the bank has provisioned for this
+    #: identity AT ALL, which never stops being true.
+    if enrollment.activated_at is None:
+        enrollment.activated_at = enrollment.enrolled_at
+    await _audit(
+        session,
+        username=enrollment.username,
+        enrollment_id=enrollment.id,
+        event="enrollment",
+        outcome="enrolled",
+    )
+    await session.commit()
+    return FaceSubmitResponse(
+        status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat()
+    )
+
+
 @router.post("/enrollments/{enrollment_id}/face", response_model=FaceSubmitResponse)
 async def submit_face(
     enrollment_id: str, body: FaceSubmitRequest, session: SessionDep, request: Request
@@ -676,10 +750,15 @@ async def submit_face(
         raise ProblemError(
             404, "enrollment-not-found", "Enrollment not found", "No such enrollment."
         )
-    if enrollment.status == "enrolled":
-        # Idempotent re-submission: already enrolled, no state change.
+    if enrollment.status in ("enrolled", "awaiting_activation"):
+        #: IDEMPOTENT re-submission. Both states mean the face is already in —
+        #: `awaiting_activation` is a customer who finished and is waiting on
+        #: the bank, and re-sending their face must not disturb either one.
         return FaceSubmitResponse(
-            status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat()
+            status=enrollment.status,
+            enrolled_at=(
+                enrollment.enrolled_at.isoformat() if enrollment.enrolled_at else None
+            ),
         )
     if enrollment.status != "awaiting_face":
         # The staged flow (T24 anchor → OTP → consent) must be complete before
@@ -742,17 +821,38 @@ async def submit_face(
         old.superseded_by = template.id
     #: kept in step for legacy readers; the template table is the authority
     enrollment.embedding_encrypted = sealed_at_rest
-    enrollment.status = "enrolled"
-    enrollment.enrolled_at = utcnow()
+    #: THE CUSTOMER IS DONE — AND WHETHER EVERYTHING IS DEPENDS ON THE BANK
+    #: (owner ruling 2026-09-11). This used to write `enrolled` unconditionally,
+    #: which made a brand-new identity look complete while the bank had never
+    #: heard of it.
+    #:
+    #: TWO CASES, and `activated_at` is what tells them apart:
+    #:
+    #: A FIRST ENROLMENT has no profile behind it, so the face is the last thing
+    #: the CUSTOMER does and not the last thing that happens — it waits.
+    #: `enrolled_at` stays empty for the same reason: it records when the
+    #: enrolment finished, and it has not.
+    #:
+    #: A RE-BIND after a lost device already has one. Nothing needs creating,
+    #: so making that customer wait would be waiting for an event that is never
+    #: coming — the bank has no work to do and no reason to act.
+    if enrollment.activated_at is not None:
+        enrollment.status = "enrolled"
+        enrollment.enrolled_at = utcnow()
+    else:
+        enrollment.status = "awaiting_activation"
     await _audit(
         session,
         username=enrollment.username,
         enrollment_id=enrollment.id,
         event="face_submission",
-        outcome="enrolled",
+        outcome="enrolled" if enrollment.enrolled_at else "awaiting-activation",
     )
     await session.commit()
-    return FaceSubmitResponse(status="enrolled", enrolled_at=enrollment.enrolled_at.isoformat())
+    return FaceSubmitResponse(
+        status=enrollment.status,
+        enrolled_at=enrollment.enrolled_at.isoformat() if enrollment.enrolled_at else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +925,10 @@ async def revoke_face(
     #: re-asking would be theatre rather than assurance.
     enrollment.status = "awaiting_face"
     enrollment.enrolled_at = None
+    #: `activated_at` is deliberately NOT cleared. Losing a phone does not undo
+    #: the bank having made a profile, and that is exactly what lets the
+    #: replacement face go straight back to `enrolled` instead of waiting for an
+    #: activation nobody is going to perform twice.
     enrollment.embedding_encrypted = None      # legacy mirror must not linger
 
     await _audit(session, enrollment.username, enrollment_id=enrollment.id,

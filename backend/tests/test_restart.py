@@ -23,6 +23,7 @@ from tests.test_api import (
     DEMO_PASSWORD,
     DEMO_USER,
     VEC_A,
+    _activate,
     _consent,
     _enroll,
     _enroll_with_face,
@@ -102,6 +103,11 @@ def test_the_whole_journey_runs_again_after_a_restart(harness):
     _generate_and_verify_otp(harness, eid)
     assert _consent(harness, eid).status_code == 200
     assert _face(harness, eid, VEC_A).status_code == 200
+    #: a FIRST enrolment ends here, not at `enrolled` (2026-09-11) — the
+    #: customer has finished and the bank has not acted yet
+    assert _status(harness) == "awaiting_activation"
+
+    assert _activate(harness, eid).status_code == 200
     assert _status(harness) == "enrolled"
 
 
