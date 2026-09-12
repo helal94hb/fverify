@@ -1,5 +1,25 @@
 node_modules/
+
+#: THE IDENTITY DATABASE AND EVERYTHING DERIVED FROM IT. This file holds
+#: password hashes, encrypted face templates and mobile numbers -- the most
+#: sensitive data in the program, and the one store with no second copy.
+#:
+#: `*.db` ALONE WAS NOT ENOUGH, and the gap was live: a backup taken before an
+#: ALTER TABLE on 2026-09-12 was named `face-verify.db.bak-<date>`, which does
+#: not END in `.db`, so it sat untracked and one `git add -A` from the remote.
+#: SQLite's own sidecars (`-wal`, `-shm`, `-journal`) have the same shape and
+#: the same contents.
+#:
+#: INTERIM. fverify is going to Postgres, at which point the database stops
+#: being a file in the tree and these rules stop being the thing standing
+#: between a stray backup and a push.
 *.db
+*.db-*
+*.db.*
+*.bak
+*.bak-*
+*.sqlite
+*.sqlite3
 __pycache__/
 .venv/
 .env
