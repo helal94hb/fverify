@@ -137,6 +137,35 @@ class StatusResponse(BaseModel):
     status: str | None = None
 
 
+class CredentialVerifyRequest(BaseModel):
+    """SIGN-IN, and it carries exactly what enrolment carried: one sealed
+    envelope holding the username and the password.
+
+    NO SEPARATE USERNAME FIELD, deliberately. Enrolment takes the name from
+    INSIDE the envelope, so login does too — a username beside the envelope
+    would be a second copy of the same fact, and two copies mean a mismatch
+    case nobody would have a rule for.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    credential_enc: str = Field(min_length=8, max_length=4096)
+
+
+class CredentialVerifyResponse(BaseModel):
+    """The verdict, and NOTHING that varies with why a rejection happened.
+
+    `status` is present ONLY on a verified credential. A rejection that carried
+    the identity's stage would answer "does this username exist" and "how far
+    did they get" to anyone willing to guess — the same directory the challenge
+    endpoint refuses to become. Whoever holds the correct password already knows
+    the identity exists; everyone else learns nothing.
+    """
+
+    verdict: str
+    status: str | None = None
+
+
 class ChallengeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -954,6 +983,98 @@ async def enrollment_status(username: str, session: SessionDep):
         enrolled_at=enrollment.enrolled_at.isoformat(),
         status=enrollment.status,
     )
+
+
+@router.post("/verifications/credential", response_model=CredentialVerifyResponse)
+async def verify_credential(
+    body: CredentialVerifyRequest,
+    session: SessionDep,
+    request: Request,
+    settings: SettingsDep,
+):
+    """SIGN IN — is this username and password the one this identity enrolled with?
+
+    THE FIRST READ OF `password_hash` IN THIS SERVICE'S LIFE. It has been
+    written at every enrolment and consumed by nothing; `verify_password` was
+    built ready for this caller and has been sitting unused. Nothing about the
+    stored credential changes here — argon2id at the OWASP baseline, its own
+    salt per row — only that something finally asks.
+
+    WHY IT LIVES HERE AND NOT IN THE BANK (owner ruling, restated 2026-09-12:
+    fverify IS the identity management system). The bank was checking passwords
+    itself against hashes it kept, which made two identity stores and left the
+    one that is supposed to be authoritative unable to answer the only question
+    identity exists to answer.
+
+    SEALED, LIKE EVERY OTHER CREDENTIAL ON THIS SEAM. The orchestrator persists
+    its inputs in run state, so a password crossing it in the clear would be
+    readable in a console afterwards. `_unseal_credential` fails closed on
+    anything that is not an `enc1:` envelope, so a caller cannot fall back to
+    plaintext by omission.
+
+    WHAT IT DOES NOT DECIDE: whether a verified identity may actually sign in.
+    A revoked face, an unfinished enrolment and a profile the bank has disabled
+    are all correct-password cases with different answers, and those answers
+    belong to the caller. This says the credential is right and what stage the
+    identity is at; the policy is not this service's to hold.
+    """
+    #: UNSEAL FIRST, exactly as `/verifications` does with its embedding. The
+    #: order matters for a reason worth stating: the username is INSIDE the
+    #: envelope, so there is nothing to rate-limit on until it is open.
+    cred = _unseal_credential(body.credential_enc, request)
+
+    #: LOCKOUT, on the same mechanism the face factor uses — recent failures for
+    #: this identity inside a window. A password endpoint without this is a
+    #: guessing oracle, and argon2 slows an attacker down without stopping one.
+    cutoff = utcnow() - timedelta(seconds=settings.verify_window_seconds)
+    recent_failures = await session.scalar(
+        select(func.count(AuditEvent.id)).where(
+            AuditEvent.username == cred.username,
+            AuditEvent.event == "credential",
+            AuditEvent.outcome == "rejected",
+            AuditEvent.created_at >= cutoff,
+        )
+    )
+    if (recent_failures or 0) >= settings.verify_max_attempts:
+        await _audit(session, cred.username, "credential", "locked")
+        await session.commit()
+        raise ProblemError(
+            429,
+            "credential-locked",
+            "Sign-in locked",
+            "Too many failed sign-in attempts. Try again later.",
+        )
+
+    enrollment = await session.scalar(
+        select(Enrollment).where(Enrollment.username == cred.username)
+    )
+
+    #: AN UNKNOWN USERNAME COSTS THE SAME AS A WRONG PASSWORD. Without this the
+    #: two are told apart by a stopwatch: a real row spends ~19 MiB and two
+    #: argon2 passes, a missing one returns immediately. Verifying against a
+    #: throwaway hash of the same parameters spends it anyway, so the service
+    #: does not become a directory of who banks here.
+    stored = enrollment.password_hash if enrollment is not None else passwords.decoy_hash()
+    ok = passwords.verify_password(stored, cred.password)
+
+    if enrollment is None or not ok:
+        await _audit(session, cred.username, "credential", "rejected")
+        await session.commit()
+        return CredentialVerifyResponse(verdict="rejected")
+
+    #: LEGACY ROWS UPGRADE ON THE ONE OCCASION THE PLAINTEXT IS IN HAND. A hash
+    #: written under older parameters can only be re-made during a successful
+    #: verification, which is why `needs_rehash` was built alongside the
+    #: verifier rather than after it.
+    if passwords.needs_rehash(enrollment.password_hash):
+        enrollment.password_hash = passwords.hash_password(cred.password)
+
+    await _audit(
+        session, cred.username, "credential", "verified",
+        enrollment_id=enrollment.id,
+    )
+    await session.commit()
+    return CredentialVerifyResponse(verdict="verified", status=enrollment.status)
 
 
 @router.post("/verifications/challenge", response_model=ChallengeResponse)

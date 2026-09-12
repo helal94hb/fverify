@@ -32,15 +32,27 @@ PARAMETERS
     scheme did not have and could not be tuned into having.
 
 CURRENT REALITY, STATED SO NOBODY ASSUMES OTHERWISE
-    Nothing in this service verifies a password today: `password_hash` is
-    written at enrolment and never read. `verify_password` exists so that when
-    that changes, the legacy rows are handled correctly rather than discovered
-    at the worst moment.
+    [SUPERSEDED 2026-09-12 — kept, because the sentence it replaces is the
+    reason this module was built the way it was.] It read: "Nothing in this
+    service verifies a password today: `password_hash` is written at enrolment
+    and never read. `verify_password` exists so that when that changes, the
+    legacy rows are handled correctly rather than discovered at the worst
+    moment."
+
+    That day came. `POST /verifications/credential` is the caller, and it is the
+    first read of `password_hash` in this service's life. The foresight paid:
+    `verify_password` and `needs_rehash` were already correct for legacy rows,
+    so sign-in did not have to be built and migrated at the same time.
+
+    What the new caller added is `decoy_hash` — a timing equaliser that did not
+    matter while nothing verified, and matters the moment something does.
 """
 
 from __future__ import annotations
 
+import base64
 import hmac
+import os
 import re
 
 from argon2 import PasswordHasher
@@ -88,6 +100,27 @@ def verify_password(stored: str, plaintext: str) -> bool:
         return _HASHER.verify(stored, plaintext)
     except (VerificationError, InvalidHashError):
         return False
+
+
+#: A REAL HASH OF A VALUE NOBODY HOLDS, built once at import.
+#:
+#: Verifying against it costs exactly what verifying a genuine row costs —
+#: ~19 MiB and two argon2 passes. That is its whole purpose: without it, an
+#: unknown username returns in microseconds while a known one takes the full
+#: argon2 time, and the difference is measurable from outside. A stopwatch then
+#: answers "does this person bank here", which is the same directory the
+#: challenge endpoint deliberately refuses to become.
+#:
+#: The secret is 32 bytes of urandom generated at import and never stored, so
+#: there is no plaintext that verifies against it — not even by accident.
+_DECOY = _HASHER.hash(base64.urlsafe_b64encode(os.urandom(32)).decode())
+
+
+def decoy_hash() -> str:
+    """A hash to verify against when there is no row, so the miss costs what a
+    hit costs. The result of that verification is always False and must be
+    discarded — it is spent for its DURATION, not its answer."""
+    return _DECOY
 
 
 def needs_rehash(stored: str) -> bool:
