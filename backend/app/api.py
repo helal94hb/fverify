@@ -164,6 +164,10 @@ class CredentialVerifyResponse(BaseModel):
 
     verdict: str
     status: str | None = None
+    #: present ONLY on a verified credential, for the same reason `status`
+    #: is: it names the identity that was proven, and a rejection proves
+    #: nothing about any identity at all.
+    user_ref: str | None = None
 
 
 class ChallengeRequest(BaseModel):
@@ -313,6 +317,20 @@ async def _active_template(session, enrollment: Enrollment) -> bytes | None:
     if row is not None:
         return row.embedding_encrypted
     return enrollment.embedding_encrypted
+
+
+def user_ref(username: str, key: str) -> str:
+    """A verdict is about ONE identity; this is what says which one.
+
+    HMAC rather than the username itself because the answer travels back through
+    the orchestrator, which persists what it carries and is deliberately never
+    told who is signing in. The bank knows the username it asked about, so it
+    recomputes this and compares; nothing in between can read it or forge it.
+    """
+    import hashlib
+    import hmac
+
+    return hmac.new(key.encode(), username.strip().lower().encode(), hashlib.sha256).hexdigest()
 
 
 def _unseal_credential(credential_enc: str, request: Request) -> "_Credential":
@@ -1074,7 +1092,13 @@ async def verify_credential(
         enrollment_id=enrollment.id,
     )
     await session.commit()
-    return CredentialVerifyResponse(verdict="verified", status=enrollment.status)
+    return CredentialVerifyResponse(
+        verdict="verified",
+        status=enrollment.status,
+        #: BINDS THE VERDICT TO THIS USERNAME. Without it "verified" is a bare
+        #: yes, and the caller can attach it to any username it likes.
+        user_ref=user_ref(cred.username, settings.user_ref_key),
+    )
 
 
 @router.post("/verifications/challenge", response_model=ChallengeResponse)

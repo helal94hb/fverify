@@ -114,6 +114,24 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     # DEV-ONLY default — any real deployment MUST set FV_OTP_EXPORT_KEY.
     otp_export_key: str = "dGhpcy1pcy1hLWRldi1vbmx5LWtleS0zMmJ5dGVzISE="
 
+    #: HMAC key binding a verdict to the username it was reached for.
+    #:
+    #: WHY A DIGEST AND NOT THE NAME. The bank cannot see inside the envelope —
+    #: only this service can — so when it is told "verified" it has no way to
+    #: know WHICH identity was verified, and was resolving whichever username the
+    #: caller put beside the envelope. Anyone holding one valid credential could
+    #: therefore be issued a session for somebody else's username.
+    #:
+    #: Returning the username would close that and open another: the verdict
+    #: travels back through the orchestrator, which persists what it carries, and
+    #: the orchestrator is deliberately never told who is signing in. An HMAC is
+    #: opaque to everything in between and checkable by the one party that knows
+    #: the username it asked about.
+    #:
+    #: Dev default so a bare checkout runs; a real deployment sets FV_USER_REF_KEY
+    #: and the bank's matching value, or the bank refuses every sign-in.
+    user_ref_key: str = "dev-only-user-ref-key-change-me"
+
 
 @lru_cache
 def get_settings() -> Settings:
