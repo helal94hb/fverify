@@ -14,6 +14,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _DEV_ONLY_AT_REST_KEY = "6Mn63B3HGwFzFOVl6czGyPlDbzMDyCt9PyvTIEy0dxE="
 
 
+#: The BANK's dev PUBLIC key — the public half only, so nothing secret lives
+#: here. It is the address a verified identity's name is sealed to; the bank
+#: holds the private half and is the only party that can read it.
+_BANK_DEV_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA556h6DOi2H8x0mUkP11Y
+wPZJeIkHEdctOgtgH6XxPgM+UKE5f9amr1MDR/mJrFnu7flxyIEqbIA4vwN9fxgh
+U27HefkMvp0pVj5ELw4d91OyGffcp6dxEOkUHIcWpwupzR7FcertcG3kJvYNAuej
+brYIkgKYjQBa+ENQ4v81b11QbZN9Ppjl7AJ8aEU/o3k5QL0dnWPbxofQYqNOmyyg
+0H5ZQtUNbep6YG3h8jQxlslWMUloPwjCTN0ZE47Ph4lVjvOGb/LZt0Xr3wGFP7z6
+XST35NgMkFevxfBa43DMm1kkBtgoM5q29ibV22gEL5NuWiM9QbkTWeameY5w/Ggr
+RxVP0K77ZXSiHP2wCxp4brNqBoDsgDg4lbevzS8gQTscNcg9rTzMLc6DAL6X9pTl
+61TwsFyLXUANkNubygYK6WkJ3UBBKdqRkfnvLRw1105J1J8FTrsBsngufUCifUWL
+A8sqfkc9l2KP6fD3NjuIDyO+2XCbYA1rumgS61UpBqrdAgMBAAE=
+-----END PUBLIC KEY-----"""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FV_", env_file=".env", extra="ignore")
 
@@ -130,7 +146,21 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     #:
     #: Dev default so a bare checkout runs; a real deployment sets FV_USER_REF_KEY
     #: and the bank's matching value, or the bank refuses every sign-in.
-    user_ref_key: str = "dev-only-user-ref-key-change-me"
+    #: THE BANK'S PUBLIC KEY — where a verified identity's NAME is sent.
+    #:
+    #: A verdict has to say WHO it is about, and the bank must not be told by the
+    #: caller: a sign-in request carries no username precisely so there is
+    #: nothing for a caller to lie about. So this service names the identity it
+    #: verified, sealed to the bank, and the answer travels back through the
+    #: orchestrator as ciphertext only the bank can open — which is what keeps
+    #: the orchestrator from learning who is signing in.
+    #:
+    #: Dev default matches the bank's dev keypair so a bare checkout works; a
+    #: real deployment sets FV_BANK_PUBLIC_KEY_PEM. A wrong key here means the
+    #: bank cannot open the name and refuses the sign-in, which is the correct
+    #: direction for that to fail in.
+    bank_public_key_pem: str = _BANK_DEV_PUBLIC_KEY
+    bank_key_id: str = "bank-dev1"
 
 
 @lru_cache

@@ -110,6 +110,24 @@ def _parse(token: str, prefix: str, version: int, alg: str) -> dict:
     return envelope
 
 
+def seal_envelope(plaintext: bytes, public_key: rsa.RSAPublicKey, key_id: str) -> str:
+    """The encrypt side of the envelope this module already opens.
+
+    Same `enc1:` shape in both directions, so the bank's existing opener reads
+    it unchanged: one wire format on this seam rather than a second one invented
+    for the return leg.
+    """
+    import base64
+    import json
+
+    ct = public_key.encrypt(plaintext, _oaep())
+    env = {"v": 1, "alg": "RSA-OAEP-SHA-256", "k": key_id,
+           "ct": base64.urlsafe_b64encode(ct).decode()}
+    return "enc1:" + base64.urlsafe_b64encode(
+        json.dumps(env, separators=(",", ":")).encode()
+    ).decode()
+
+
 def unseal_envelope(token: str, private_key: rsa.RSAPrivateKey) -> bytes:
     """Decrypt an `enc1:` or `enc2:` envelope and return the plaintext bytes.
 

@@ -164,10 +164,11 @@ class CredentialVerifyResponse(BaseModel):
 
     verdict: str
     status: str | None = None
-    #: present ONLY on a verified credential, for the same reason `status`
-    #: is: it names the identity that was proven, and a rejection proves
-    #: nothing about any identity at all.
-    user_ref: str | None = None
+    #: WHO was verified, sealed to the bank. Present ONLY on a verified
+    #: credential, for the same reason `status` is: it names an identity, and a
+    #: rejection proves nothing about any identity at all — a name returned on a
+    #: rejection would answer "does this username exist" to anyone guessing.
+    subject_enc: str | None = None
 
 
 class ChallengeRequest(BaseModel):
@@ -319,18 +320,23 @@ async def _active_template(session, enrollment: Enrollment) -> bytes | None:
     return enrollment.embedding_encrypted
 
 
-def user_ref(username: str, key: str) -> str:
+def subject_envelope(username: str, bank_public_key_pem: str, key_id: str) -> str:
     """A verdict is about ONE identity; this is what says which one.
 
-    HMAC rather than the username itself because the answer travels back through
-    the orchestrator, which persists what it carries and is deliberately never
-    told who is signing in. The bank knows the username it asked about, so it
-    recomputes this and compares; nothing in between can read it or forge it.
-    """
-    import hashlib
-    import hmac
+    THE BANK IS NOT TOLD BY THE CALLER. A sign-in request carries no username at
+    all — the name lives inside the credential envelope, which only this service
+    can open — so there is nothing for a caller to lie about. This is how the
+    bank learns whose credential was just proven.
 
-    return hmac.new(key.encode(), username.strip().lower().encode(), hashlib.sha256).hexdigest()
+    Sealed to the bank rather than returned in the clear because the answer
+    travels back through the orchestrator, which persists what it carries and is
+    deliberately never told who is signing in. To it this is opaque; the bank
+    holds the private half.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    public_key = serialization.load_pem_public_key(bank_public_key_pem.strip().encode())
+    return seal.seal_envelope(username.encode(), public_key, key_id)
 
 
 def _unseal_credential(credential_enc: str, request: Request) -> "_Credential":
@@ -1095,9 +1101,11 @@ async def verify_credential(
     return CredentialVerifyResponse(
         verdict="verified",
         status=enrollment.status,
-        #: BINDS THE VERDICT TO THIS USERNAME. Without it "verified" is a bare
-        #: yes, and the caller can attach it to any username it likes.
-        user_ref=user_ref(cred.username, settings.user_ref_key),
+        #: NAMES THE IDENTITY THAT WAS PROVEN. Without it "verified" is a bare
+        #: yes, and the bank would have to be told whose it was by the caller.
+        subject_enc=subject_envelope(
+            cred.username, settings.bank_public_key_pem, settings.bank_key_id
+        ),
     )
 
 
