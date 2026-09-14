@@ -5,6 +5,12 @@ import json
 import os
 from dataclasses import dataclass
 
+#: The test env is a dev env — it runs on some dev-default secrets (the OTP salt,
+#: the bank public key), so it opts into the dev-default guard before any app
+#: import can build settings. Set at import time so collection-time app builds
+#: and non-harness tests are covered too; `setdefault` lets a test clear it.
+os.environ.setdefault("FV_ALLOW_DEV_DEFAULTS", "true")
+
 import pytest
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization

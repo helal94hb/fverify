@@ -2,6 +2,15 @@
 
 All settings use the ``FV_`` env prefix. This service is fully decoupled from
 the digital-banking platform: its own database, its own keys, its own config.
+
+DEV-DEFAULT SECRETS FAIL CLOSED. Every secret below ships with a working dev
+default so a bare checkout runs — and each of those defaults is in the git
+history. A production container that forgets to set one would otherwise seal
+face templates and credentials with a key anyone can read, silently. So
+`get_settings()` REFUSES TO START when any guarded secret is still its dev
+default, unless `FV_ALLOW_DEV_DEFAULTS=true` is set (local dev and tests). The
+guard fails closed on purpose: safety you have to remember to switch on is
+safety you will forget on the one deploy that matters.
 """
 
 from functools import lru_cache
@@ -30,21 +39,10 @@ A8sqfkc9l2KP6fD3NjuIDyO+2XCbYA1rumgS61UpBqrdAgMBAAE=
 -----END PUBLIC KEY-----"""
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FV_", env_file=".env", extra="ignore")
-
-    # This service's OWN database file. Never the banking database.
-    database_url: str = "sqlite+aiosqlite:///./face-verify.db"
-
-    # Fernet key for at-rest encryption of stored embeddings.
-    at_rest_key: str = _DEV_ONLY_AT_REST_KEY
-
-    # PEM RSA private key used to unseal `enc1:` envelopes. The DEV pair below
-    # is this app's OWN (kid "fv-dev1") — never the banking platform's dev1
-    # pair: decoupling means separate keys, and a banking-sealed payload must
-    # never open here. The public half is bundled in the app (ml/seal.ts).
-    # Rotates at first real deployment; env override may use literal "\n" escapes.
-    seal_private_key_pem: str | None = """-----BEGIN PRIVATE KEY-----
+# DEV-ONLY private key used to unseal `enc1:` envelopes (kid "fv-dev1"). This
+# app's OWN dev pair, never the banking platform's. Any real deployment MUST set
+# FV_SEAL_PRIVATE_KEY_PEM; env override may use literal "\n" escapes.
+_DEV_ONLY_SEAL_PRIVATE_KEY_PEM = """-----BEGIN PRIVATE KEY-----
 MIIG/QIBADANBgkqhkiG9w0BAQEFAASCBucwggbjAgEAAoIBgQDklI6VtcxTIBEL
 2DN1fSkr2nxb0w42libil/zhZEIYTyyKbk0jhKZUacbsyaErWW0MY5y/N8zeWc7A
 kdXa/QpMszVibjQxlXTIV4GRkGm8tHLIRtTTpvFssefldftc+z/3x7/KOVBTzH4d
@@ -85,6 +83,33 @@ vOeN3dbWubLArLGLeb75R/+ZM29A+nNgMqs/5hftFA4ni/M9yjOwokI909ZqpgDc
 sjV5z6EPiOahKjJ6yBbRrxw=
 -----END PRIVATE KEY-----"""
 
+#: DEV-ONLY salt for one-time-secret hashing. A real deployment sets FV_OTP_HASH_SALT.
+_DEV_ONLY_OTP_HASH_SALT = "fv-dev-only-salt"
+
+#: DEV-ONLY AES-256-GCM key for OTPs exported to Agentys, base64 of 32 bytes.
+#: A real deployment MUST set FV_OTP_EXPORT_KEY.
+_DEV_ONLY_OTP_EXPORT_KEY = "dGhpcy1pcy1hLWRldi1vbmx5LWtleS0zMmJ5dGVzISE="
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FV_", env_file=".env", extra="ignore")
+
+    # This service's OWN database file. Never the banking database.
+    database_url: str = "sqlite+aiosqlite:///./face-verify.db"
+
+    #: Escape hatch for local dev and tests: permits the dev-default secrets
+    #: below. OFF by default so a real deployment fails closed — see the module
+    #: docstring and `_assert_secrets_are_real`.
+    allow_dev_defaults: bool = False
+
+    # Fernet key for at-rest encryption of stored embeddings.
+    at_rest_key: str = _DEV_ONLY_AT_REST_KEY
+
+    # PEM RSA private key used to unseal `enc1:` envelopes. The DEV pair is this
+    # app's OWN (kid "fv-dev1") — never the banking platform's dev1 pair: a
+    # banking-sealed payload must never open here. Public half bundled in the app.
+    seal_private_key_pem: str | None = _DEV_ONLY_SEAL_PRIVATE_KEY_PEM
+
     # Cosine-similarity threshold for a `verified` verdict (owner ruling
     # 2026-08-31: 0.80).
     match_threshold: float = 0.8
@@ -122,47 +147,60 @@ sjV5z6EPiOahKjJ6yBbRrxw=
     otp_max_verify_attempts: int = 5
     otp_resend_cooldown_seconds: int = 60
     #: salt for one-time-secret hashing (env-overridden per environment)
-    otp_hash_salt: str = "fv-dev-only-salt"
+    otp_hash_salt: str = _DEV_ONLY_OTP_HASH_SALT
 
     # AES-256-GCM key for encrypting OTPs exported to Agentys.
     # Must be a 32-byte key, base64-encoded. Generate with:
     #   python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
-    # DEV-ONLY default — any real deployment MUST set FV_OTP_EXPORT_KEY.
-    otp_export_key: str = "dGhpcy1pcy1hLWRldi1vbmx5LWtleS0zMmJ5dGVzISE="
+    otp_export_key: str = _DEV_ONLY_OTP_EXPORT_KEY
 
-    #: HMAC key binding a verdict to the username it was reached for.
-    #:
-    #: WHY A DIGEST AND NOT THE NAME. The bank cannot see inside the envelope —
-    #: only this service can — so when it is told "verified" it has no way to
-    #: know WHICH identity was verified, and was resolving whichever username the
-    #: caller put beside the envelope. Anyone holding one valid credential could
-    #: therefore be issued a session for somebody else's username.
-    #:
-    #: Returning the username would close that and open another: the verdict
-    #: travels back through the orchestrator, which persists what it carries, and
-    #: the orchestrator is deliberately never told who is signing in. An HMAC is
-    #: opaque to everything in between and checkable by the one party that knows
-    #: the username it asked about.
-    #:
-    #: Dev default so a bare checkout runs; a real deployment sets FV_USER_REF_KEY
-    #: and the bank's matching value, or the bank refuses every sign-in.
-    #: THE BANK'S PUBLIC KEY — where a verified identity's NAME is sent.
-    #:
-    #: A verdict has to say WHO it is about, and the bank must not be told by the
-    #: caller: a sign-in request carries no username precisely so there is
-    #: nothing for a caller to lie about. So this service names the identity it
-    #: verified, sealed to the bank, and the answer travels back through the
-    #: orchestrator as ciphertext only the bank can open — which is what keeps
-    #: the orchestrator from learning who is signing in.
-    #:
-    #: Dev default matches the bank's dev keypair so a bare checkout works; a
-    #: real deployment sets FV_BANK_PUBLIC_KEY_PEM. A wrong key here means the
-    #: bank cannot open the name and refuses the sign-in, which is the correct
-    #: direction for that to fail in.
+    #: THE BANK'S PUBLIC KEY — where a verified identity's NAME is sealed. In
+    #: production this MUST be the real bank's public key: left at the dev
+    #: default, verified names seal to a keypair whose private half sits in the
+    #: BFF repo, so the sealed subject could be opened by anyone holding it.
+    #: A wrong key means the bank cannot open the name and refuses the sign-in,
+    #: which is the correct direction for that to fail in.
     bank_public_key_pem: str = _BANK_DEV_PUBLIC_KEY
     bank_key_id: str = "bank-dev1"
 
 
+#: Secrets that must never run on their dev default in production. Each maps the
+#: setting name to the exact dev value the guard compares against. `bank_key_id`
+#: is a label, not a secret, so it is not guarded.
+_GUARDED_DEV_DEFAULTS: dict[str, str] = {
+    "at_rest_key": _DEV_ONLY_AT_REST_KEY,
+    "seal_private_key_pem": _DEV_ONLY_SEAL_PRIVATE_KEY_PEM,
+    "otp_hash_salt": _DEV_ONLY_OTP_HASH_SALT,
+    "otp_export_key": _DEV_ONLY_OTP_EXPORT_KEY,
+    "bank_public_key_pem": _BANK_DEV_PUBLIC_KEY,
+}
+
+
+def _assert_secrets_are_real(settings: Settings) -> None:
+    """Refuse to run on dev-default secrets unless explicitly allowed.
+
+    Fails closed: a deployment that sets no keys stops here rather than silently
+    encrypting face templates and credentials with keys that are in the git
+    history. `FV_ALLOW_DEV_DEFAULTS=true` opts local dev and tests back in.
+    """
+    if settings.allow_dev_defaults:
+        return
+    offenders = [
+        f"FV_{name.upper()}"
+        for name, dev_value in _GUARDED_DEV_DEFAULTS.items()
+        if getattr(settings, name) == dev_value
+    ]
+    if offenders:
+        raise RuntimeError(
+            "fverify refuses to start: these secrets are still their DEV DEFAULTS "
+            "(published in the repository): " + ", ".join(sorted(offenders)) + ". "
+            "Set real values for each, or set FV_ALLOW_DEV_DEFAULTS=true for local "
+            "development and tests."
+        )
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    _assert_secrets_are_real(settings)
+    return settings

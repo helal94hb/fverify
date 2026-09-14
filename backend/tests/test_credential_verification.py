@@ -82,15 +82,16 @@ def test_an_unknown_username_is_rejected_IDENTICALLY(harness):
 
     assert wrong_password.status_code == no_such_user.status_code == 200
     assert wrong_password.json() == no_such_user.json()
-    #: `user_ref` is null here and that is load-bearing, not incidental: the ref
-    #: NAMES the identity that was proven, so a rejection carrying one would
+    #: `subject_enc` is null here and that is load-bearing, not incidental: it
+    #: SEALS the identity that was proven, so a rejection carrying one would
     #: answer "does this username exist" to anyone willing to guess — the very
-    #: question this test exists to keep unanswered. The whole-body form is what
-    #: caught it when the field was added.
+    #: question this test exists to keep unanswered. (It replaced the earlier
+    #: `user_ref` HMAC in the login cleanse; same role, same null-on-rejection.)
+    #: The whole-body form is what catches a field being added or renamed.
     assert no_such_user.json() == {
         "verdict": "rejected",
         "status": None,
-        "user_ref": None,
+        "subject_enc": None,
     }
 
 
